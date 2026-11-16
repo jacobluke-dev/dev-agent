@@ -13,3 +13,4 @@ htmlcov/
 .env.*
 config.local.toml
 dev-agent.local.toml
+tasks/
