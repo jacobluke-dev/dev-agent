@@ -1,0 +1,30 @@
+# Synthetic examples only. Copy to ~/.config/dev-agent/config.toml and edit.
+# Relative paths resolve from the configuration file's directory; ~ is expanded.
+runs_root = "~/.local/state/dev-agent/runs"
+
+[projects.example]
+repository = "~/src/example-service"
+base_branch = "main"
+worktree_root = "~/.local/state/dev-agent/worktrees/example"
+
+[[projects.example.verification]]
+name = "tests"
+argv = ["uv", "run", "pytest"]
+timeout_seconds = 600
+
+[[projects.example.verification]]
+name = "lint"
+argv = ["uv", "run", "ruff", "check", "."]
+timeout_seconds = 120
+
+[projects.example.agent]
+# model = "YOUR_SUPPORTED_CODEX_MODEL"
+reasoning_effort = "medium"
+timeout_seconds = 1800
+
+[projects.docs-example]
+repository = "~/src/example-docs"
+base_branch = "main"
+worktree_root = "~/.local/state/dev-agent/worktrees/docs-example"
+# No checks configured: runs are explicitly unverified, never reported as succeeded.
+verification = []
