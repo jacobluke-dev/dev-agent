@@ -1,6 +1,7 @@
 """Read-only investigation fixtures for assessment, instruction and delivery tests."""
 
 import json
+import re
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -10,6 +11,7 @@ import pytest
 from dev_agent.config import Config, RepositoryContext
 from dev_agent.investigation.validation import FACTORS
 from dev_agent.process import ProcessResult, execute
+from dev_agent.records import RunRecord
 from tests.support.atlassian import atlassian as atlassian
 
 
@@ -163,3 +165,65 @@ print('fake diagnostic', file=sys.stderr)
 sys.exit(int(sys.argv[5]))
 """)
     return FakeInvestigator(executable)
+
+
+class FakeReviewer:
+    """Provide a controllable review response and optional integrity violation for fixtures."""
+
+    def __init__(self) -> None:
+        """Initialise the observation counter, passing verdict and inactive fault switches."""
+        self.calls = 0
+        self.verdict = "passed"
+        self.invalid = False
+        self.mutate = False
+
+    def preflight(self) -> RunRecord:
+        """Report synthetic runner capabilities without requiring Codex or credentials."""
+        return {"provider": "fake-codex", "sandbox": "read-only", "isolation": "test-only"}
+
+    def run(self, worktree: Path, prompt: str, directory: Path, config: object) -> ProcessResult:
+        """Build candidate-bound review output and invoke the publishing fixture's fake response
+        process.
+        """
+        self.calls += 1
+        assert "separate ephemeral review invocation" in prompt
+        snapshot = json.loads((directory.parent / "requirements-snapshot.json").read_text())
+        baseline = re.search(r"Controller baseline: ([0-9a-f]+)", prompt)[1]
+        fingerprint = re.search(r"Controller source fingerprint: ([0-9a-f]+)", prompt)[1]
+        value = {
+            "schema_version": 1,
+            "task_id": snapshot["task_id"],
+            "baseline_commit": baseline,
+            "source_fingerprint": fingerprint,
+            "verdict": self.verdict,
+            "summary": "Synthetic static review.",
+            "criteria": [
+                {
+                    "requirement_id": r["requirement_id"],
+                    "status": "reviewed",
+                    "explanation": "Candidate has the expected fixture value.",
+                    "evidence": [{"path": "hello.py", "line": 1, "quote": "VALUE = 2"}],
+                }
+                for r in snapshot["requirements"]
+            ],
+            "findings": [],
+        }
+        if self.invalid:
+            value["criteria"] = []
+        if self.mutate:
+            (worktree / "hello.py").chmod(0o644)
+            (worktree / "hello.py").write_text("unsafe mutation\n")
+        return execute(
+            [
+                sys.executable,
+                "-c",
+                "import pathlib,sys;pathlib.Path(sys.argv[1]).write_text(sys.argv[2]);"
+                'print(\'{"type":"turn.completed"}\')',
+                str(directory / "final-response.md"),
+                json.dumps(value),
+            ],
+            cwd=worktree,
+            stdout=directory / "agent-events.jsonl",
+            stderr=directory / "agent.stderr.log",
+            timeout=10,
+        )
