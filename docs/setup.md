@@ -1449,10 +1449,12 @@ manual index/commit inspection; there is no automatic reset or unstage operation
 Do not manually push additional commits and expect old approval to cover them.
 New source changes require a separately reviewed implementation/publication flow.
 
-Historical runs remain readable but cannot be published if they lack mandatory
-instruction-supply/scope evidence. Reverification alone cannot reconstruct proof
-that the original agent received the hierarchy. This is especially relevant to
-runs predating instruction enforcement: no historical-run bypass is provided.
+The original historical run stays ineligible for direct publication when it
+lacks instruction-supply evidence. For an eligible retained worktree, the
+[legacy adoption workflow](quickstart.md#adopt-a-retained-legacy-implementation)
+records a separate current audit, targeted and full verification, independent
+review, and explicit acceptance of the provenance gap. Publish the resulting
+adoption ID using the usual draft preview and confirmation.
 
 ## Security
 
@@ -1720,7 +1722,7 @@ The original implementation outcome and later verification attempt outcomes rema
 | `10` | Implementation instruction/audit/scope gate failed (`instructions_failed`); worktree retained, no accepted implementation. |
 | `11` | Confirmed publication failed after its gates; inspect publication phase and recovery evidence. |
 | `12` | Publication completed or CI was inspected, but CI is not confirmed passed (including absent/skipped checks and monitoring timeout). |
-| `13` | Unified delivery is blocked/incomplete, awaiting confirmation or has CI that is not passed. |
+| `13` | Unified delivery is blocked/incomplete, awaiting confirmation or has CI that is not passed. Adoption is blocked by verification or review. |
 | `130` | Interrupted execution. |
 
 `environment_failed` describes required setup or declared prerequisite failures.

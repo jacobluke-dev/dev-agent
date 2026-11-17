@@ -16,7 +16,7 @@ for commands or [setup](setup.md) for configuration and operational details.
 | [`integrations/`](../src/dev_agent/integrations/) | Bounded Atlassian REST reads and trusted GitHub CLI calls. Credentials are scoped to their integration. |
 | [`repository/`](../src/dev_agent/repository/) | Local Git, exact baseline and worktree identity, sealed snapshots, instruction resolution and scope audits. |
 | [`investigation/`](../src/dev_agent/investigation/) | Standalone static assessment, structured result validation and the packaged v1 schema. |
-| [`delivery/`](../src/dev_agent/delivery/) | Implementation, ticket checkpoints, independent review, publication eligibility and CI observation. |
+| [`delivery/`](../src/dev_agent/delivery/) | Implementation, ticket checkpoints, legacy adoption, independent review, publication eligibility and CI observation. |
 | [`verification/`](../src/dev_agent/verification/) | Preparation, prerequisite checks, verification profiles and evidence matched to source and configuration. |
 | [`records.py`](../src/dev_agent/records.py), [`process.py`](../src/dev_agent/process.py) and [`errors.py`](../src/dev_agent/errors.py) | Canonical JSON, per-run advisory locks, bounded subprocess handling and shared exceptions. |
 | [`reporting/`](../src/dev_agent/reporting/) | Private projections, log and evidence copies, and Markdown reports. |
@@ -85,6 +85,12 @@ Canonical records live under `runs_root/RUN-ID/`. A delivery's parent record
 references its implementation run. The latter owns the source-bound verification
 and review history, publication evidence and CI observations. Results under
 `results_root/TASK-ID/RUN-ID/` are projections with links to evidence.
+
+Legacy adoption uses one separate checkpoint linked to the original run's
+preserved record and retained worktree. Fresh scope, verification and review
+evidence is tied to the candidate. An explicit operator decision records
+acceptance of the historical provenance gap. Adoption and publication share
+the original run's worktree lock. See [legacy adoption](quickstart.md#adopt-a-retained-legacy-implementation).
 
 Resumption checks project, ticket, configuration digest, baseline, artifact
 hashes and child linkage. It reuses the linked implementation run. An uncertain

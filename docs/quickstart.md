@@ -10,6 +10,7 @@ reviewed Markdown brief to `implement`, then use the steps below.
 - [Configure a project](#configure-a-project)
 - [Jira MCP and OAuth](#jira-mcp-and-oauth)
 - [Walk through delivery](#walk-through-delivery)
+- [Adopt a retained legacy implementation](#adopt-a-retained-legacy-implementation)
 - [Command reference](#command-reference)
 - [Flag reference](#flag-reference)
 - [Recovery and resumption](#recovery-and-resumption)
@@ -298,6 +299,53 @@ See [architecture](architecture.md#delivery-lifecycle) for details and diagrams.
    Review the workflow policy before confirming. Check the draft and CI before
    manually merging.
 
+## Adopt a retained legacy implementation
+
+Use `adopt` for a completed, unpublished implementation whose record lacks
+historical instruction-enforcement evidence. Dev Agent reuses its exact Git
+worktree and checks its baseline, current source, applicable `AGENTS.md` files,
+configured modification scope and allowed publication paths. It runs targeted
+and full verification and an independent read-only review. The original run
+record stays intact. The new adoption record owns the current evidence.
+
+From the directory containing the original `tasks/TASK-123.md`, run:
+
+```bash
+uv run dev-agent adopt ORIGINAL-RUN-ID
+```
+
+Dev Agent uses the brief only when its hash matches the original run. If that
+file is unavailable, point to a successful investigation of the same Jira
+ticket and project with `--requirements-run INVESTIGATION-RUN-ID`. This reuses
+the recorded, integrity-checked snapshot and requires no task file. If neither
+source is available, adoption stops. To run trusted setup before the first
+pending check, add `--prepare`. A full audit includes ignored files and stops
+when it exceeds the configured audit limits. Large retained worktrees can
+require a larger `context.max_audit_bytes` budget.
+
+Inspect the new adoption ID and the exact source, verification and review
+evidence. Historical enforcement remains `not_recorded` even after the current
+checks pass. To accept that limitation for this exact candidate, supply the
+printed `approval_sha256`. That records your decision locally. Publication
+still requires a separate preview and confirmation.
+
+```bash
+uv run dev-agent inspect ADOPTION-RUN-ID
+uv run dev-agent results ADOPTION-RUN-ID
+uv run dev-agent adopt ORIGINAL-RUN-ID --accept-legacy APPROVAL-SHA256
+uv run dev-agent publish ADOPTION-RUN-ID --draft --dry-run
+uv run dev-agent publish ADOPTION-RUN-ID --draft --confirm --plan-sha256 REVIEWED-PLAN-SHA256
+uv run dev-agent ci ADOPTION-RUN-ID --watch
+```
+
+The adoption route requires passing full verification and review without a
+waiver. It cannot adopt a run whose original instruction audit failed. Before
+publication starts, rerun `adopt ORIGINAL-RUN-ID` to resume unfinished checks.
+Changes to the source, configuration or requirements require new evidence and
+approval. Once publication starts, use `publish` with the same adoption ID to
+recover its recorded commit, push and draft PR. The original ID remains the
+worktree owner for explicit cleanup.
+
 ## Command reference
 
 Run these examples from the Dev Agent checkout with `uv run`. With a tool
@@ -310,6 +358,7 @@ the parent delivery run. Use its linked `implementation_run_id` for `verify`,
 | --- | --- | --- | --- |
 | `dev-agent projects list` | Required `list` action | Lists configured names, repository paths, base branches and legacy check names as JSON. | Invalid configuration. This listing does not establish that named profiles will pass. |
 | `dev-agent implement TASK-123 --project example --prompt-file tasks/TASK-123.md` | `TASK`, `--project`, `--prompt-file`. Optional `--verification`, `--scope`, `--dry-run`. | Creates a retained worktree, prepares it, invokes Codex and verifies with targeted or legacy. Prints the run record and paths. Dry-run prints a local plan. | Invalid task or instruction context, unavailable runner, failed setup, agent or checks. A retained run can be unverified. |
+| `dev-agent adopt ORIGINAL-RUN-ID` | Original retained implementation ID. Optional `--requirements-run`, `--prepare` or separate `--accept-legacy`. | Audits the current candidate, qualifies both verification profiles and obtains read-only review. A separate acceptance invocation records legacy provenance approval. Prints the linked adoption ID and evidence status. | Ineligible original run, missing requirements, invalid candidate or scope, failed checks or review, stale approval. |
 | `dev-agent investigate TASK-123 --project example --dry-run` | Jira issue key, `--project`. Optional `--dry-run`. | Live reads preconfigured Atlassian REST sources, runs read-only Codex against a sealed baseline, and records an advisory report. Dry-run prints a local plan. | Missing provider config or credentials, failed retrieval, unavailable mandatory context, invalid assessment or failed snapshot integrity. |
 | `dev-agent deliver TASK-123 --project example --draft --dry-run` | Jira issue key, `--project`, `--draft`. Optional `--dry-run`, `--confirm`, `--watch`, `--resume`. | Dry-run prints local preflight. Live records a delivery and currently stops at MCP intake. With qualified intake, it can run through publication preview, and confirmed runs can publish a draft. CI takes one observation by default. | Missing profiles or instructions, `mcp_unavailable`, incomplete checks or review, publication blockers, incompatible checkpoint, or CI without a pass. |
 | `dev-agent verify RUN-ID --profile full` | Implementation ID. Optional `--profile`, `--prepare`. | Runs targeted or legacy by default in the retained worktree. Appends a source-bound attempt and prints its JSON and the original outcome. | Invalid or removed worktree, missing profile, failed prerequisites or failed checks. |
@@ -336,7 +385,9 @@ findings. There is no standalone `review` command.
 | `--scope PATH` | `implement` | Optional and repeatable. Selects literal baseline files or directories. An explicit list replaces the configured scope. Globs and paths outside the repository are invalid. |
 | `--verification {targeted,full,legacy}` | `implement` | Optional. Defaults to targeted if configured, otherwise legacy. Chooses trusted checks to run after implementation. |
 | `--profile {targeted,full,legacy}` | `verify` | Optional. Defaults to targeted if configured, otherwise legacy. Chooses a check profile only. |
-| `--prepare` | `verify` | Off by default. Runs configured setup in the retained worktree. Prerequisites are checked before verification either way. Trusted commands may install dependencies or use the network. |
+| `--prepare` | `verify`, `adopt` | Off by default. Runs configured setup in the retained worktree. Adoption runs setup before its first pending check and disallows it during legacy acceptance. Trusted commands may install dependencies or use the network. |
+| `--requirements-run INVESTIGATION-RUN-ID` | `adopt` | Optional. Uses the saved requirements snapshot from the same project's successful investigation. By default, adoption looks for the exact original brief. |
+| `--accept-legacy APPROVAL-SHA256` | `adopt` | Optional. Records operator acceptance of missing historical instruction evidence for the previously qualified candidate. Separate from `--prepare`, `--requirements-run` and publication confirmation. |
 | `--draft` | `publish`, `deliver` | Required. Selects the supported PR mode. Requires `--confirm` before publication mutations. |
 | `--dry-run` | `implement`, `investigate`, `deliver`, `publish` | Off by default. Previews and does not write state. `publish` previews by default in the absence of `--confirm` and rejects combining the two flags. `deliver` gives the dry-run branch precedence. |
 | `--confirm` | `publish`, `deliver` | Off by default. Authorises a validated commit, push and draft PR creation only. It does not authorise merging, deployment or bypassing checks. |
@@ -426,9 +477,9 @@ re-run with the same options as shown in the [walkthrough](#walk-through-deliver
 | Unsupported provider, model or reasoning setting | Check `[projects.NAME.agent]`. Codex is the available runner. Use an account-supported model and a supported reasoning setting, or omit the optional values. See the saved agent error and [agent settings](setup.md#agent-properties). | Start a new implementation for a changed model or config. |
 | Missing authentication | Identify which stage failed. Check Codex model login, the file-backed login used for sealed runs, or host Atlassian OAuth as applicable. For standalone Jira retrieval, validate the configured credential variable names using [setup](setup.md#jira-investigation). | Restoring the same required access can unblock a checkpoint. It cannot supply missing source or model execution evidence. |
 | Invalid configuration | Run `projects list`, check the printed schema error and compare the selected file with the example. Check relative paths against the TOML directory. | Re-run preflight after correcting it. A changed delivery configuration requires a new execution. |
-| Missing or invalid instructions | Inspect the exact baseline and required document paths, hashes and scope audit. Commit missing documents through the repository's normal process. Review any out-of-scope changes. Old runs with absent provenance cannot be certified retroactively. | Use a new compliant implementation when mandatory evidence is absent or the baseline must change. |
+| Missing or invalid instructions | Inspect the exact baseline and required document paths, hashes and scope audit. Commit missing documents through the repository's normal process. Review any out-of-scope changes. | An eligible run with missing historical evidence can use [adoption](#adopt-a-retained-legacy-implementation). Invalid current context or a failed historical audit blocks adoption. |
 | Targeted verification failed | Read the latest attempt and its stdout/stderr. Separate reported prerequisites from failed test assertions. Correct the environment or candidate under review and rerun targeted and full as needed. | Append checks to an intact retained worktree. A new source identity requires current verification and any applicable review evidence. |
-| Full verification incomplete | Inspect the full profile logs, prerequisites and fingerprint. Rerun full on the reviewed source. Standalone `publish` accepts a separately recorded incomplete-full acknowledgement with a reason. `deliver` requires passing full evidence. | Reinspect the plan after verification. There is no delivery override for full checks. |
+| Full verification incomplete | Inspect the full profile logs, prerequisites and fingerprint. Rerun full on the reviewed source. Standalone publication of a normal implementation accepts a separately recorded incomplete-full acknowledgement with a reason. | Reinspect the plan after verification. Delivery and legacy adoption require full verification to pass. |
 | Publication blocked | Compare the plan blockers with local scope, staged state, source fingerprints, required review and the intended remote and base branch. Resolve eligible issues and preview again. | Reuse the same run for a compatible partial publication. Conflicting state needs manual reconciliation. |
 | GitHub authentication failed | Check `gh auth status --hostname github.com` and access to the configured origin with the intended account. Authenticate via `gh` outside Dev Agent. | Preview again, then reconfirm if required. |
 | Missing or skipped CI checks | Inspect the PR head SHA, recorded `ci` observation, `workflow` evidence and the GitHub Actions triggers. Draft conditions can skip workflows. Missing, skipped and unavailable checks do not establish a pass. | Observe again with `ci --watch` if checks are expected to appear. |
