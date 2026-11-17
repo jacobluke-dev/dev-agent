@@ -1,12 +1,47 @@
 # Synthetic examples only. Copy to ~/.config/dev-agent/config.toml and edit.
 # Relative paths resolve from the configuration file's directory; ~ is expanded.
 runs_root = "~/.local/state/dev-agent/runs"
+# Default for source/editable installs: <dev-agent repository>/results.
+# Set an absolute results_root here when installing from a wheel or changing the destination.
+# results_root = "~/dev-agent-results"
 
 [projects.example]
 repository = "~/src/example-service"
 base_branch = "main"
 worktree_root = "~/.local/state/dev-agent/worktrees/example"
 
+# Trusted executable policy: installation may use the network and run project scripts.
+# Keep this only after reviewing the target project and its lockfiles.
+[[projects.example.preparation]]
+name = "python-environment"
+argv = ["uv", "sync", "--locked"]
+timeout_seconds = 600
+cwd = "."
+required = true
+
+[projects.example.env]
+PYTHONPATH = "{worktree}/src"
+
+[projects.example.prerequisites]
+paths = ["pyproject.toml"]
+executables = ["uv"]
+
+[[projects.example.verification_profiles.targeted]]
+name = "unit-tests"
+argv = ["uv", "run", "pytest", "tests/unit"]
+timeout_seconds = 300
+
+[[projects.example.verification_profiles.full]]
+name = "regression"
+argv = ["uv", "run", "pytest"]
+timeout_seconds = 900
+
+[[projects.example.verification_profiles.full]]
+name = "lint"
+argv = ["uv", "run", "ruff", "check", "."]
+timeout_seconds = 120
+
+# Existing verification arrays remain available as the explicit legacy profile.
 [[projects.example.verification]]
 name = "tests"
 argv = ["uv", "run", "pytest"]
@@ -22,9 +57,68 @@ timeout_seconds = 120
 reasoning_effort = "medium"
 timeout_seconds = 1800
 
+# Optional, privileged publication policy. Only explicitly confirmed draft publication writes
+# to GitHub. Match origin exactly; literal source paths only (no . or glob patterns).
+[projects.example.github]
+# deliver also needs targeted/full checks above. Live MCP ticket intake is not yet
+# qualified; no additional token or provider switch enables it. See docs/setup.md#ticket-delivery.
+repository = "example-org/example-service"
+allowed_paths = ["src", "tests", "docs", "pyproject.toml", "uv.lock"]
+ci_timeout_seconds = 600
+poll_interval_seconds = 10
+
+# Implemented investigation route: REST. Native Codex MCP replacement is not yet qualified.
+# There is no project mcp table; unknown settings are rejected. See docs/mcp-qualification.md.
+# Optional investigation-only settings. No credentials are stored here.
+# Separate Atlassian API tokens are required; ChatGPT MCP authentication is not reused.
+[projects.example.atlassian]
+site_url = "https://example.atlassian.net"
+auth_method = "api_token"
+email_env = "DEV_AGENT_ATLASSIAN_EMAIL"
+token_env = "DEV_AGENT_JIRA_TOKEN"
+# Separate Confluence product token when using scoped tokens:
+confluence_token_env = "DEV_AGENT_CONFLUENCE_TOKEN"
+# Required for scoped tokens: use your site's cloud ID to route through api.atlassian.com.
+# cloud_id = "YOUR-CLOUD-ID"
+# Classic/unscoped API tokens use site_url directly when cloud_id is omitted.
+# Include any custom acceptance field IDs whose names are not 'Acceptance Criteria'.
+acceptance_fields = []
+discover_acceptance_fields = true
+search_confluence = true
+confluence_page_ids = []
+max_linked_issues = 5
+max_confluence_pages = 8
+timeout_seconds = 30
+max_response_bytes = 2097152
+
+[projects.example.context]
+# Root AGENTS.md is mandatory. Nested AGENTS.md is discovered automatically at any depth.
+# Do not list each nested file, and do not mark any AGENTS.md optional.
+instruction_filename = "AGENTS.md"
+require_root_instructions = true
+enforce_nested_instructions = true
+# Synthetic architecture path: replace with maintained baseline documents or use [].
+required_documents = ["docs/architecture.md"]
+# Legacy optional_instructions means extra architecture, never instruction policy.
+optional_instructions = ["docs/testing.md"]
+# Fully pre-supplied hierarchy covers the repository; narrow with CLI --scope or this list.
+implementation_scope = ["."]
+max_document_bytes = 65536
+max_total_bytes = 262144
+max_prompt_bytes = 1048576
+# Include ignored dependency files in before/after implementation audits.
+max_audit_files = 200000
+max_audit_bytes = 2147483648
+
+[projects.example.investigation]
+max_snapshot_bytes = 134217728
+max_snapshot_files = 20000
+max_prompt_bytes = 524288
+
 [projects.docs-example]
 repository = "~/src/example-docs"
 base_branch = "main"
 worktree_root = "~/.local/state/dev-agent/worktrees/docs-example"
+# Root AGENTS.md remains mandatory even for this documentation-only project.
 # No checks configured: runs are explicitly unverified, never reported as succeeded.
 verification = []
