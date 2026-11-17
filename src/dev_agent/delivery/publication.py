@@ -16,6 +16,7 @@ from copy import deepcopy
 from pathlib import Path, PurePosixPath
 
 from dev_agent.config import Config
+from dev_agent.delivery.adoption import audit_candidate, validate_adoption
 from dev_agent.delivery.review import validate_recorded_review
 from dev_agent.errors import DevAgentError
 from dev_agent.integrations.github import GitHub, GitHubError, ci_observation
@@ -27,8 +28,10 @@ from dev_agent.repository.git import (
     source_state,
     validate_managed_worktree,
     validate_repository,
+    validate_unstaged_worktree,
 )
 from dev_agent.repository.instructions import (
+    InstructionBundle,
     audit_files,
     check_documents,
     digest,
@@ -188,7 +191,15 @@ def pull_body(record: RunRecord, plan: RunRecord) -> str:
             f"Human acknowledgement: {plan['incomplete_full_reason']}\n\n"
         )
     )
+    adoption_note = (
+        "Legacy implementation adopted. Historical instruction enforcement was unrecorded. "
+        "Current scope audit, verification and independent review passed. "
+        "The operator explicitly accepted the missing historical provenance.\n\n"
+        if plan.get("legacy_adoption")
+        else ""
+    )
     return (
+        f"{adoption_note}"
         f"{warning}## Summary\n\n{plan['summary']}\n\n"
         f"Task: {record['task']}\n\n## Purpose and architecture\n\n"
         "Delivers the approved task requirements. Baseline repository instructions and "
@@ -204,6 +215,41 @@ def pull_body(record: RunRecord, plan: RunRecord) -> str:
         "A draft PR is not approval. No automatic merging or deployment is requested.\n\n"
         f"dev-agent run: `{record['run_id']}`\n"
     )
+
+
+def validate_implementation_scopes(
+    config: Config, record: RunRecord, bundle: InstructionBundle, audit: RunRecord
+) -> RunRecord:
+    """Require the normal pre-supply evidence and recheck current implementation scopes."""
+    compliance = record.get("instruction_compliance", {})
+    if (
+        compliance.get("status") != "changed_scopes_validated"
+        or compliance.get("failures")
+        or any(
+            compliance.get(k, {}).get("status") != "validated"
+            for k in ("changed_file_validation", "final_changed_file_validation")
+        )
+    ):
+        raise DevAgentError(
+            "Mandatory instruction/scope enforcement did not pass or was not recorded"
+        )
+    if compliance.get("bundle_sha256") != bundle.provenance()["bundle_sha256"]:
+        raise DevAgentError("Baseline instruction policy differs from supplied context")
+    check_documents(bundle, audit, record["approved_scope"])
+    before = Store(config.runs_root).directory(record["run_id"]) / "instruction-audit-before.json"
+    if before.is_symlink() or not before.is_file() or before.stat().st_size > 64 * 1024 * 1024:
+        raise DevAgentError("Original instruction audit is unavailable")
+    validation = validate_changes(
+        bundle,
+        deepcopy(compliance),
+        json.loads(before.read_text()),
+        audit,
+        record["approved_scope"],
+        Path(record["worktree"]),
+    )
+    if validation["status"] != "validated":
+        raise DevAgentError("Current worktree violates mandatory instruction scopes")
+    return validation
 
 
 def publication_plan(
@@ -230,7 +276,8 @@ def publication_plan(
     Raises:
         DevAgentError: If eligibility or safe preview prerequisites cannot be established.
     """
-    if record.get("kind", "implementation") != "implementation" or record.get("cleanup"):
+    kind = record.get("kind", "implementation")
+    if kind not in ("implementation", "adoption") or record.get("cleanup"):
         raise DevAgentError("Publication requires a retained implementation run")
     if (
         record.get("phase") != "finished"
@@ -250,66 +297,19 @@ def publication_plan(
     baseline = record.get("baseline_commit", "")
     if not re.fullmatch(r"[0-9a-f]{40,64}", baseline):
         raise DevAgentError("Original baseline commit is unknown")
-    compliance = record.get("instruction_compliance", {})
-    if (
-        compliance.get("status") != "changed_scopes_validated"
-        or compliance.get("failures")
-        or any(
-            compliance.get(k, {}).get("status") != "validated"
-            for k in ("changed_file_validation", "final_changed_file_validation")
-        )
-    ):
-        raise DevAgentError(
-            "Mandatory instruction/scope enforcement did not pass or was not recorded"
-        )
-    bundle = resolve_project(project, baseline)
-    if compliance.get("bundle_sha256") != bundle.provenance()["bundle_sha256"]:
-        raise DevAgentError("Baseline instruction policy differs from supplied context")
-    audit = audit_files(root, project.context)
-    check_documents(bundle, audit, record["approved_scope"])
-    before_path = (
-        Store(config.runs_root).directory(record["run_id"]) / "instruction-audit-before.json"
-    )
-    if (
-        before_path.is_symlink()
-        or not before_path.is_file()
-        or before_path.stat().st_size > 64 * 1024 * 1024
-    ):
-        raise DevAgentError("Original instruction audit is unavailable")
-    validation = validate_changes(
-        bundle,
-        deepcopy(compliance),
-        json.loads(before_path.read_text()),
-        audit,
-        record["approved_scope"],
-        root,
-    )
-    if validation["status"] != "validated":
-        raise DevAgentError("Current worktree violates mandatory instruction scopes")
-    # Reject in-progress Git operations and user-staged changes rather than absorbing them.
-    for name in (
-        "MERGE_HEAD",
-        "CHERRY_PICK_HEAD",
-        "REVERT_HEAD",
-        "rebase-merge",
-        "rebase-apply",
-        "sequencer",
-        "index.lock",
-    ):
-        if Path(output(root, "rev-parse", "--path-format=absolute", "--git-path", name)).exists():
-            raise DevAgentError("Unexpected in-progress Git operation or index lock")
-    if (
-        git(
-            root, "diff", "--cached", "--no-ext-diff", "--no-textconv", "--quiet", check=False
-        ).returncode
-        != 0
-    ):
-        raise DevAgentError("Existing staged changes are unexpected; inspect and unstage manually")
-    if any(p[:1] != b"H" for p in git(root, "ls-files", "-v", "-z").stdout.split(b"\0") if p):
-        raise DevAgentError(
-            "Skip-worktree/assume-unchanged or unresolved index entries are unsupported"
-        )
+    validate_unstaged_worktree(root)
     current = source_state(root)
+    bundle = resolve_project(project, baseline)
+    audit = audit_files(root, project.context)
+    if kind == "adoption":
+        if allow_incomplete_full or incomplete_full_reason:
+            raise DevAgentError(
+                "Legacy adoption requires passing full verification without override"
+            )
+        adoption_audit = audit_candidate(project, record, bundle, audit)
+        validation = adoption_audit["changes"]
+    else:
+        validation = validate_implementation_scopes(config, record, bundle, audit)
     content = source_content(root, audit)
     prior = record.get("publication", {})
     owned = prior.get("commit_sha")
@@ -329,7 +329,10 @@ def publication_plan(
                 "certify it"
             )
         fingerprint = approved["verified_fingerprint"]
-    if record.get("delivery_id"):
+    legacy_approval = None
+    if kind == "adoption":
+        legacy_approval = validate_adoption(config, project, record, fingerprint, adoption_audit)
+    elif record.get("delivery_id"):
         validate_recorded_review(config, record, fingerprint)
     names = git(
         root,
@@ -472,6 +475,8 @@ def publication_plan(
             "deployment jobs. Review workflow policy before confirmation."
         ),
     }
+    if legacy_approval:
+        plan["legacy_adoption"] = legacy_approval
     plan["body"] = pull_body(record, plan)
     # Timestamps and post-commit index/HEAD changes are not approval identity.
     plan["plan_sha256"] = digest(
@@ -607,7 +612,7 @@ def publish_run(
     if not confirmed or dry_run:
         plan, _ = publication_plan(config, store.load(run_id), **options)
         return {"dry_run": dry_run, "confirmed": False, "plan": plan}
-    with store.lock(run_id):
+    with store.lock_candidate(run_id):
         record = store.load(run_id)
         plan, client = publication_plan(config, record, **options)
         if plan_sha256 and plan_sha256 != plan["plan_sha256"]:
@@ -826,7 +831,7 @@ def ci_run(config: Config, run_id: str, *, watch: bool = False) -> RunRecord:
     evidence.
     """
     store = Store(config.runs_root)
-    with store.lock(run_id):
+    with store.lock_candidate(run_id):
         record = store.load(run_id)
         pub = record.get("publication", {})
         if not pub.get("pr_number") or not pub.get("commit_sha"):

@@ -40,6 +40,14 @@ def parser() -> argparse.ArgumentParser:
         action="append",
         help="Approved baseline file/directory; repeat to select several (no globs)",
     )
+    adoption = commands.add_parser(
+        "adopt",
+        help="Qualify a retained legacy implementation without running Codex implementation",
+    )
+    adoption.add_argument("run_id", metavar="ORIGINAL-RUN-ID")
+    adoption.add_argument("--requirements-run", metavar="INVESTIGATION-RUN-ID")
+    adoption.add_argument("--prepare", action="store_true")
+    adoption.add_argument("--accept-legacy", metavar="APPROVAL-SHA256")
     investigation = commands.add_parser(
         "investigate", help="Read-only Jira/baseline investigation; never start implementation"
     )
@@ -184,6 +192,22 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Run report/logs: {store.directory(record['run_id'])}")
             print(f"Results: {record.get('results_directory', 'not exported')}")
             return exit_code(record["outcome"])
+        elif args.command == "adopt":
+            from dev_agent.delivery.adoption import adopt, summary
+
+            record = adopt(
+                config,
+                args.run_id,
+                requirements_run=args.requirements_run,
+                prepare=args.prepare,
+                accept_legacy=args.accept_legacy,
+            )
+            dump(summary(record))
+            return (
+                0
+                if record["adoption"]["status"] in ("awaiting_legacy_approval", "approved")
+                else 13
+            )
         elif args.command == "investigate":
             from dev_agent.investigation.workflow import investigate
 

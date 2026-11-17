@@ -5,6 +5,7 @@ File replacement is atomic and Linux advisory locks coordinate operations for on
 """
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -29,6 +30,11 @@ def now() -> str:
 def new_id(project: str, task: str) -> str:
     """Build a sortable run ID with project, task and a random collision suffix."""
     return f"{datetime.now(UTC):%Y%m%dT%H%M%S%fZ}-{project}-{task}-{uuid.uuid4().hex[:8]}"
+
+
+def adoption_id(run_id: str) -> str:
+    """Derive the one adoption checkpoint that may own a legacy worktree's publication."""
+    return f"adopt-{hashlib.sha256(run_id.encode()).hexdigest()}"
 
 
 class Store:
@@ -115,6 +121,20 @@ class Store:
                 yield
             finally:
                 fcntl.flock(stream, fcntl.LOCK_UN)
+
+    @contextmanager
+    def lock_candidate(self, run_id: str) -> Iterator[None]:
+        """Lock the original worktree before its adoption record for publication and CI."""
+        record = self.load(run_id)
+        if record.get("kind") == "adoption":
+            origin = record["adopted_from"]
+            if adoption_id(origin) != run_id:
+                raise DevAgentError("Invalid adoption checkpoint identity")
+            with self.lock(origin), self.lock(run_id):
+                yield
+        else:
+            with self.lock(run_id):
+                yield
 
 
 def log(directory: Path, message: str) -> None:

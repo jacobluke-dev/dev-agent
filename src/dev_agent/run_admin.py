@@ -23,6 +23,10 @@ def inspect_run(config: Config, run_id: str) -> RunRecord:
     runs and historical records can be inspected using the evidence they retain.
     """
     record = Store(config.runs_root).load(run_id)
+    if record.get("kind") == "adoption":
+        from dev_agent.delivery.adoption import summary
+
+        return summary(record)
     if record.get("kind") == "delivery":
         return {"kind": "delivery", **delivery_summary(config, record)}
     if record.get("kind") == "investigation":
@@ -104,6 +108,8 @@ def cleanup(config: Config, run_id: str, *, confirmed: bool, force: bool = False
     store = Store(config.runs_root)
     with store.lock(run_id):
         record = store.load(run_id)
+        if record.get("kind") == "adoption":
+            raise DevAgentError("Clean up the original retained worktree using its original run ID")
         if record.get("kind") == "investigation":
             return cleanup_investigation(config, record, force=force)
         if record.get("cleanup"):

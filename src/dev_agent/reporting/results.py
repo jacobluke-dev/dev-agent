@@ -44,6 +44,26 @@ def summary(record: RunRecord, directory: Path) -> str:
             "- Independent static review: "
             + inline(record.get("independent_review", {}).get("status", "not_performed")),
         ]
+    if record.get("kind") == "adoption":
+        adoption = record["adoption"]
+        lines += [
+            "",
+            "## Legacy adoption",
+            "",
+            f"- Original run: {inline(record['adopted_from'])}",
+            "- Historical instruction enforcement: unrecorded",
+            "- Current instruction and scope audit: "
+            + inline(
+                adoption.get("candidate", {})
+                .get("audit", {})
+                .get("changes", {})
+                .get("status", "not_run")
+            ),
+            "- Independent static review: "
+            + inline(record.get("independent_review", {}).get("status", "not_run")),
+            f"- Legacy provenance status: {inline(adoption.get('status', 'planned'))}",
+            f"- Approval digest: {inline(adoption.get('approval_sha256'))}",
+        ]
     attempts = record.get("verification_attempts", [])
     for profile in ("targeted", "full", "legacy"):
         selected = [a for a in attempts if a["profile"] == profile]
@@ -70,7 +90,9 @@ def summary(record: RunRecord, directory: Path) -> str:
         "",
         "## Changes",
         "",
-        "Original run changed files:",
+        "Audited candidate changed files:"
+        if record.get("kind") == "adoption"
+        else "Original run changed files:",
         "",
     ]
     lines += [f"- {inline(name)}" for name in record.get("files_changed", [])] or [

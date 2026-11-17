@@ -10,7 +10,7 @@ from pathlib import Path
 
 from dev_agent.config import Config, Project
 from dev_agent.errors import DevAgentError
-from dev_agent.records import RunRecord, Store, log, new_id, now
+from dev_agent.records import RunRecord, Store, adoption_id, log, new_id, now
 from dev_agent.reporting.common import reserve_results
 from dev_agent.reporting.results import save_with_results
 from dev_agent.repository.git import changed_files, source_state, validate_managed_worktree
@@ -173,6 +173,10 @@ def verify(
     store = Store(config.runs_root)
     with store.lock(run_id):
         record = store.load(run_id)
+        if record.get("kind") == "adoption" or store.directory(adoption_id(run_id)).exists():
+            raise DevAgentError(
+                "Use adopt with the original run ID to recheck an adopted candidate"
+            )
         if record.get("kind") == "delivery":
             raise DevAgentError("Use the linked implementation_run_id for verification")
         if record.get("kind") == "investigation":

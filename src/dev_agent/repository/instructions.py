@@ -481,8 +481,22 @@ def validate_changes(
     changed = sorted(
         path for path in before.keys() | after.keys() if before.get(path) != after.get(path)
     )
-    result = {"status": "validated", "files": changed, "applicable_sets": {}, "violations": []}
-    for path in changed:
+    return validate_changed_paths(bundle, changed, after, scopes, root, supplied_state=state)
+
+
+def validate_changed_paths(
+    bundle: InstructionBundle,
+    paths: list[str],
+    files: RunRecord,
+    scopes: list[RunRecord],
+    root: Path,
+    *,
+    supplied_state: RunRecord | None = None,
+) -> RunRecord:
+    """Audit changed paths and resolve ancestry, checking prompt supply when recorded."""
+    result = {"status": "validated", "files": paths, "applicable_sets": {}, "violations": []}
+    for path in paths:
+        safe_path(path)
         reason = None
         if not in_scope(path, scopes):
             reason = "outside approved modification scope"
@@ -493,7 +507,7 @@ def validate_changes(
             )
         elif CONTROL_DIRECTORIES.intersection(PurePosixPath(path).parts):
             reason = "agent control/credential directory is outside governed source scope"
-        elif after.get(path, {}).get("type") == "symlink" or not (
+        elif (path in files and files[path].get("type") != "file") or not (
             root / path
         ).parent.resolve().is_relative_to(root.resolve()):
             reason = "changed path uses an unresolved symlink scope"
@@ -501,7 +515,12 @@ def validate_changes(
             result["violations"].append({"path": path, "reason": reason})
         else:
             try:
-                result["applicable_sets"].update(applicable_sets(bundle, state, [path]))
+                if supplied_state is None:
+                    result["applicable_sets"][path] = bundle.applicable(path)
+                else:
+                    result["applicable_sets"].update(
+                        applicable_sets(bundle, supplied_state, [path])
+                    )
             except ContextError as exc:
                 result["violations"].append({"path": path, "reason": str(exc)})
     if result["violations"]:

@@ -156,7 +156,15 @@ def create_worktree(project: Project, branch: str, destination: Path, commit: st
 def changed_files(worktree: Path, baseline: str) -> list[str]:
     """List tracked differences from the baseline and untracked nonignored paths."""
     tracked = git(
-        worktree, "diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z", baseline, "--"
+        worktree,
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--name-only",
+        "-z",
+        baseline,
+        "--",
     ).stdout
     untracked = git(worktree, "ls-files", "--others", "--exclude-standard", "-z").stdout
     return sorted({os.fsdecode(p) for p in (tracked + untracked).split(b"\x00") if p})
@@ -206,6 +214,32 @@ def source_state(worktree: Path) -> RunRecord:
     }
 
 
+def validate_unstaged_worktree(root: Path) -> None:
+    """Reject Git operations, staged changes and hidden/unmerged index entries."""
+    for name in (
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "rebase-merge",
+        "rebase-apply",
+        "sequencer",
+        "index.lock",
+    ):
+        if Path(output(root, "rev-parse", "--path-format=absolute", "--git-path", name)).exists():
+            raise DevAgentError("Unexpected in-progress Git operation or index lock")
+    if (
+        git(
+            root, "diff", "--cached", "--no-ext-diff", "--no-textconv", "--quiet", check=False
+        ).returncode
+        != 0
+    ):
+        raise DevAgentError("Existing staged changes are unexpected; inspect and unstage manually")
+    if any(p[:1] != b"H" for p in git(root, "ls-files", "-v", "-z").stdout.split(b"\0") if p):
+        raise DevAgentError(
+            "Skip-worktree/assume-unchanged or unresolved index entries are unsupported"
+        )
+
+
 def validate_managed_worktree(config: Config, record: RunRecord) -> Project:
     """Reconfirm the retained worktree's branch, Git metadata and configured identity.
 
@@ -213,13 +247,14 @@ def validate_managed_worktree(config: Config, record: RunRecord) -> Project:
     moved worktrees and incompatible records raise DevAgentError.
     """
     project = config.project(record["project"])
-    expected = project.worktree_root / record["run_id"]
+    owner = record["adopted_from"] if record.get("kind") == "adoption" else record["run_id"]
+    expected = project.worktree_root / owner
     if (
         record["repository"] != str(project.repository)
         or record["worktree_root"] != str(project.worktree_root)
         or record["runs_root"] != str(config.runs_root)
         or record["worktree"] != str(expected)
-        or record["branch"] != f"dev-agent/{record['run_id']}"
+        or record["branch"] != f"dev-agent/{owner}"
         or expected.is_symlink()
         or expected.resolve() != expected
     ):

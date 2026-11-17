@@ -22,6 +22,7 @@ from dev_agent.repository.instructions import (
     applicable_sets,
     audit_files,
     check_documents,
+    digest,
     resolve_project,
     safe_path,
     supplied,
@@ -183,6 +184,7 @@ def review(
             "started_at": now(),
             "baseline_commit": record["baseline_commit"],
             "configuration_sha256": config.source_digest,
+            "requirements_sha256": digest(snapshot),
             "agent": {},
             "limitation": "Static independent review is not human approval or runtime proof",
         }
