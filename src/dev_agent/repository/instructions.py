@@ -15,7 +15,7 @@ from pathlib import Path, PurePosixPath
 from dev_agent.config import Project, RepositoryContext, relative_path
 from dev_agent.errors import DevAgentError
 from dev_agent.records import RunRecord
-from dev_agent.repository.git import git
+from dev_agent.repository.git import git, source_paths
 from dev_agent.repository.snapshot import ContextError, excluded, tree_entries
 
 LIMITATION = (
@@ -349,22 +349,35 @@ def in_scope(path: str, scopes: list[RunRecord]) -> bool:
     )
 
 
-def audit_files(root: Path, policy: RepositoryContext) -> RunRecord:
-    """Capture bounded worktree evidence and normalise unreadable files into a context error."""
+def audit_files(
+    root: Path, policy: RepositoryContext, *, previous: RunRecord | None = None
+) -> RunRecord:
+    """Hash Git-visible source and capture bounded metadata for ignored scope checks.
+
+    A publication comparison may have to rehash ignored files recorded as content
+    hashes by an older audit. Those reads still count against the content limit.
+    """
     try:
-        return _audit_files(root, policy)
+        recorded_hashes = {
+            path
+            for path, info in (previous or {}).items()
+            if info.get("type") == "file" and "sha256" in info
+        }
+        return _audit_files(root, policy, recorded_hashes)
     except OSError as exc:
         raise ContextError(
             f"Cannot complete mandatory worktree instruction audit: {exc}", []
         ) from None
 
 
-def _audit_files(root: Path, policy: RepositoryContext) -> RunRecord:
-    """Hash ALL worktree files, including ignored files, without following symlinks.
-
-    The root Git administration file is excluded; identity/HEAD is checked separately.
-    Exceeding bounds fails closed, before launching the agent or when validating its changes.
-    """
+def _audit_files(root: Path, policy: RepositoryContext, recorded_hashes: set[str]) -> RunRecord:
+    """Capture Git-selected contents and no-follow filesystem metadata in one walk."""
+    if root.is_symlink():
+        raise ContextError("Instruction audit worktree must not be a symlink", [])
+    paths = source_paths(root)
+    if len(paths) > policy.max_audit_files:
+        raise ContextError("Worktree instruction audit exceeds max_audit_files", [])
+    source = {safe_path(os.fsdecode(path)) for path in paths}
     files = {}
     total = 0
     directories_seen = 0
@@ -373,7 +386,9 @@ def _audit_files(root: Path, policy: RepositoryContext) -> RunRecord:
         """Propagate traversal failures rather than accepting a partial audit."""
         raise error
 
-    for parent, directories, names in os.walk(root, followlinks=False, onerror=walk_error):
+    for parent, directories, names, dir_fd in os.fwalk(
+        root, follow_symlinks=False, onerror=walk_error
+    ):
         directories_seen += 1
         if directories_seen + len(files) > policy.max_audit_files:
             raise ContextError("Worktree instruction audit exceeds max_audit_files", [])
@@ -382,60 +397,83 @@ def _audit_files(root: Path, policy: RepositoryContext) -> RunRecord:
             directories[:] = [name for name in directories if name != ".git"]
             names = [name for name in names if name != ".git"]
         for name in list(directories):
-            child = Path(parent) / name
-            if child.is_symlink():
+            if stat.S_ISLNK(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode):
                 directories.remove(name)
                 names.append(name)
         for name in names:
-            path = Path(parent) / name
-            key = safe_path(path.relative_to(root).as_posix())
-            initial = path.lstat()
-            if path.is_symlink():
+            key = safe_path((relative / name).as_posix())
+            initial = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            if stat.S_ISLNK(initial.st_mode):
                 value = {
                     "type": "symlink",
-                    "sha256": hashlib.sha256(os.fsencode(os.readlink(path))).hexdigest(),
+                    "sha256": hashlib.sha256(
+                        os.fsencode(os.readlink(name, dir_fd=dir_fd))
+                    ).hexdigest(),
                 }
-            elif path.is_file():
+            elif not stat.S_ISREG(initial.st_mode):
+                raise ContextError("Worktree instruction audit encountered a special file", [])
+            elif key not in source and key not in recorded_hashes:
+                # Keep ignored paths visible to the scope and AGENTS.md checks.
+                # ctime detects in-place changes even when size and mtime are restored.
+                value = {
+                    "type": "file",
+                    "metadata_only": [
+                        initial.st_dev,
+                        initial.st_ino,
+                        initial.st_size,
+                        initial.st_mtime_ns,
+                        initial.st_ctime_ns,
+                    ],
+                }
+            else:
                 total += initial.st_size
                 if total > policy.max_audit_bytes:
                     raise ContextError("Worktree instruction audit exceeds max_audit_bytes", [])
-                if not path.parent.resolve().is_relative_to(root.resolve()):
-                    raise ContextError("Instruction audit path escapes worktree", [])
-                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-                with os.fdopen(fd, "rb") as stream:
-                    opened = os.fstat(stream.fileno())
-                    if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
-                        initial.st_dev,
-                        initial.st_ino,
-                    ):
-                        raise ContextError("Instruction audit path changed during capture", [])
-                    if opened.st_size != initial.st_size:
-                        raise ContextError("Instruction audit file grew during capture", [])
-                    content = hashlib.sha256()
-                    remaining = opened.st_size
-                    while remaining:
-                        chunk = stream.read(min(remaining, 1048576))
-                        if not chunk:
-                            raise ContextError("Instruction audit file shrank during capture", [])
-                        content.update(chunk)
-                        remaining -= len(chunk)
-                    final = os.fstat(stream.fileno())
-                    if stream.read(1) or (final.st_size, final.st_mtime_ns, final.st_ctime_ns) != (
-                        opened.st_size,
-                        opened.st_mtime_ns,
-                        opened.st_ctime_ns,
-                    ):
-                        raise ContextError("Instruction audit file changed during capture", [])
-                    value = {
-                        "type": "file",
-                        "sha256": content.hexdigest(),
-                    }
-            else:
-                raise ContextError("Worktree instruction audit encountered a special file", [])
+                value = {"type": "file", "sha256": audit_file_hash(dir_fd, name, initial)}
             files[key] = value | {"mode": initial.st_mode}
             if len(files) + directories_seen > policy.max_audit_files:
                 raise ContextError("Worktree instruction audit exceeds max_audit_files", [])
+    for path in source - files.keys():
+        # A missing tracked file can be a legitimate deletion. A path hidden
+        # under a replacement symlink must never be treated as such.
+        if any(
+            files.get(str(parent), {}).get("type") == "symlink"
+            for parent in PurePosixPath(path).parents
+        ):
+            raise ContextError("Instruction audit source path crosses a symlink", [])
+    if source_paths(root) != paths:
+        raise ContextError("Git source paths changed during instruction audit", [])
     return files
+
+
+def audit_file_hash(directory: int, name: str, initial: os.stat_result) -> str:
+    """Hash one regular file through its directory descriptor and check for mutation."""
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    with os.fdopen(fd, "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+            initial.st_dev,
+            initial.st_ino,
+        ):
+            raise ContextError("Instruction audit path changed during capture", [])
+        if opened.st_size != initial.st_size:
+            raise ContextError("Instruction audit file grew during capture", [])
+        content = hashlib.sha256()
+        remaining = opened.st_size
+        while remaining:
+            chunk = stream.read(min(remaining, 1048576))
+            if not chunk:
+                raise ContextError("Instruction audit file shrank during capture", [])
+            content.update(chunk)
+            remaining -= len(chunk)
+        final = os.fstat(stream.fileno())
+        if stream.read(1) or (final.st_size, final.st_mtime_ns, final.st_ctime_ns) != (
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        ):
+            raise ContextError("Instruction audit file changed during capture", [])
+        return content.hexdigest()
 
 
 def check_documents(

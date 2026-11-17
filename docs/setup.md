@@ -460,14 +460,27 @@ Control directories (`.git`, `.codex`, `.agents`, `.aws`) and paths beneath them
 cannot be explicitly approved, including when they contain tracked files. Planning
 rejects these selections before Codex preflight or worktree creation.
 
-After preparation and before Codex, the controller hashes the worktree, including
-ignored files. Required baseline instruction/architecture files must still match
-the supplied baseline; setup-generated replacement instructions cannot change policy.
-A generated `AGENTS.md` affecting approved areas fails this gate. Audit limits or
-unreadable/special paths fail closed. The audit does not follow symlinks.
+After preparation and before Codex, the controller hashes worktree content for
+paths in the Git index and non-ignored untracked files. An index entry remains in
+scope when it matches an ignore pattern, including a staged addition. Required
+baseline instructions and architecture documents must still match their baseline
+hashes. A generated `AGENTS.md` affecting approved areas fails this gate even in
+an ignored directory. Audit limits and unreadable or special paths fail closed.
+The audit reads files through directory descriptors with symlink following disabled.
 
-After Codex, all new/deleted/modified file contents or modes, including ignored
-files, are compared against the captured state. Each changed path must be in an
+The byte budget measures regular-file content read during the audit. It limits
+the cost of hashing eligible files and is separate from the worktree's disk
+footprint. Ignored dependencies and generated files remain available for tests.
+Their paths and file metadata are inspected within the entry limit to enforce
+scope and instruction rules. For ignored regular files, that metadata includes
+size, file identity and change timestamps. The controller does not read their
+contents or calculate the total size of ignored files. Older implementation
+audits can contain content hashes for ignored files. When comparing against
+those records for publication, the controller retains the prior hash checks
+under the same byte limit.
+
+After Codex, source hashes and modes and ignored-path metadata are compared
+against the captured state. Each changed path must be in an
 approved scope and have its applicable baseline instructions supplied. Unknown
 control/symlink scopes, changed HEAD, and any creation/modification/deletion/rename
 of `AGENTS.md` reject the implementation as `instructions_failed` (exit 10), retaining
@@ -524,14 +537,15 @@ be empty. Root and discovered nested instructions remain mandatory either way.
 | `max_document_bytes` | `65536`; integer 1–1048576 for each instruction/architectural document. |
 | `max_total_bytes` | `262144`; integer 1–2097152 across all loaded instruction/architectural bodies. |
 | `max_prompt_bytes` | `1048576`; integer 1024–4194304. Investigation also applies its own `investigation.max_prompt_bytes`, using the smaller limit. Includes requirements and rendered manifest overhead; JSON encoding can increase size. |
-| `max_audit_files` | `200000`; integer 1–1000000 files/symlinks plus directory traversal entries per implementation audit, including ignored files. |
-| `max_audit_bytes` | `2147483648`; integer 1–17179869184 bytes of regular worktree content per audit. |
+| `max_audit_files` | `200000`; integer 1–1000000 file, symlink and directory entries per audit, including ignored metadata. |
+| `max_audit_bytes` | `2147483648` (2 GiB); integer 1–17179869184 bytes of eligible regular-file content per audit, including any required comparison with older saved hashes. |
 
-Auditing a prepared environment can be expensive. `.venv`, `node_modules` and other
-ignored dependencies count toward audit limits; narrower approved scopes do not
-reduce audit coverage. Review resources before increasing limits. Generated
-instruction files that intersect the approved scope require explicit human
-resolution; the orchestrator does not silently adopt them.
+Large ignored environments can still consume the entry budget because their
+metadata is checked. Narrower approved scopes do not reduce audit coverage.
+Metadata changes can flag a path even when its content is unchanged. These
+checks do not verify dependency integrity. Review resources before increasing
+limits. Generated instruction files that intersect the approved scope require
+explicit human resolution.
 
 Legacy `context.instructions` remains accepted as a list of **required baseline
 context documents**, now supplied to both workflows. An enumerated root/nested

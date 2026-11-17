@@ -701,6 +701,8 @@ def test_audit_rejects_files_changing_during_capture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Reject evidence for a file whose metadata changes during capture."""
+    import stat
+
     from dev_agent.repository import instructions
 
     original = instructions.os.fstat
@@ -711,8 +713,10 @@ def test_audit_rejects_files_changing_during_capture(
         from types import SimpleNamespace
 
         nonlocal calls
-        calls += 1
         value = original(fd)
+        if not stat.S_ISREG(value.st_mode):
+            return value
+        calls += 1
         if calls == 2:
             return SimpleNamespace(
                 st_size=value.st_size,

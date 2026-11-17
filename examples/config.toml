@@ -106,7 +106,7 @@ implementation_scope = ["."]
 max_document_bytes = 65536
 max_total_bytes = 262144
 max_prompt_bytes = 1048576
-# Include ignored dependency files in before/after implementation audits.
+# Bound source hashing and metadata inspection, including ignored-path scope checks.
 max_audit_files = 200000
 max_audit_bytes = 2147483648
 

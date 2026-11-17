@@ -319,9 +319,10 @@ file is unavailable, point to a successful investigation of the same Jira
 ticket and project with `--requirements-run INVESTIGATION-RUN-ID`. This reuses
 the recorded, integrity-checked snapshot and requires no task file. If neither
 source is available, adoption stops. To run trusted setup before the first
-pending check, add `--prepare`. A full audit includes ignored files and stops
-when it exceeds the configured audit limits. Large retained worktrees can
-require a larger `context.max_audit_bytes` budget.
+pending check, add `--prepare`. The audit hashes Git-visible source and inspects
+ignored paths for scope and instruction changes. Ignored dependency contents
+do not consume the adoption byte budget. Eligible content and inspected path
+counts must fit the configured audit limits.
 
 Inspect the new adoption ID and the exact source, verification and review
 evidence. Historical enforcement remains `not_recorded` even after the current

@@ -7,7 +7,9 @@ orchestrated separately.
 
 import hashlib
 import os
+import stat
 import subprocess
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -170,44 +172,83 @@ def changed_files(worktree: Path, baseline: str) -> list[str]:
     return sorted({os.fsdecode(p) for p in (tracked + untracked).split(b"\x00") if p})
 
 
+def source_paths(worktree: Path) -> set[bytes]:
+    """Return index paths and Git's non-ignored untracked paths as literal bytes."""
+    paths = git(worktree, "ls-files", "--cached", "--others", "--exclude-standard", "-z").stdout
+    return set(paths.split(b"\0")) - {b""}
+
+
+def ignored_paths(worktree: Path, paths: Iterable[str]) -> set[str]:
+    """Test ignore rules even for indexed paths, without trusting force-added entries."""
+    payload = b"".join(os.fsencode(path) + b"\0" for path in paths)
+    if not payload:
+        return set()
+    result = git(
+        worktree, "check-ignore", "--no-index", "-z", "--stdin", input=payload, check=False
+    )
+    if result.returncode not in (0, 1):
+        raise DevAgentError("Could not classify potentially ignored publication paths")
+    return {os.fsdecode(path) for path in result.stdout.split(b"\0") if path}
+
+
+def fingerprint_entry(worktree: Path, name: bytes) -> bytes:
+    """Encode an entry in the existing fingerprint format without following parent links."""
+    parts = os.fsdecode(name).split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise DevAgentError("Unsafe source fingerprint path")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory = os.open(worktree, directory_flags)
+    try:
+        for part in parts[:-1]:
+            mode = os.stat(part, dir_fd=directory, follow_symlinks=False).st_mode
+            if stat.S_ISREG(mode):
+                return b"missing"  # A regular file replaced an ancestor directory.
+            if stat.S_ISLNK(mode):
+                raise DevAgentError("Cannot fingerprint a source path through a symlink")
+            child = os.open(part, directory_flags, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        leaf = parts[-1]
+        initial = os.stat(leaf, dir_fd=directory, follow_symlinks=False)
+        if stat.S_ISLNK(initial.st_mode):
+            target = os.fsencode(os.readlink(leaf, dir_fd=directory))
+            return b"symlink\x00" + hashlib.sha256(target).digest()
+        if not stat.S_ISREG(initial.st_mode):
+            raise DevAgentError(
+                "Source snapshots do not support submodules or special source files"
+            )
+        fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        with os.fdopen(fd, "rb") as stream:
+            current = os.fstat(stream.fileno())
+            if not stat.S_ISREG(current.st_mode) or not os.path.samestat(initial, current):
+                raise DevAgentError("Source changed while fingerprinting")
+            return (
+                f"{current.st_mode & 0o777}:".encode()
+                + hashlib.file_digest(stream, "sha256").digest()
+            )
+    except FileNotFoundError:
+        return b"missing"
+    finally:
+        os.close(directory)
+
+
 def source_state(worktree: Path) -> RunRecord:
     """Fingerprint dirty source without writing the index or following source symlinks."""
     head = output(worktree, "rev-parse", "HEAD")
     index = git(worktree, "ls-files", "--stage", "-z").stdout
-    paths = (
-        git(worktree, "ls-files", "-z").stdout
-        + git(worktree, "ls-files", "--others", "--exclude-standard", "-z").stdout
-    )
     digest = hashlib.sha256(head.encode() + hashlib.sha256(index).digest())
-    for name in sorted(set(paths.split(b"\x00")) - {b""}):
-        candidate = worktree / os.fsdecode(name)
+    for name in sorted(source_paths(worktree)):
         digest.update(name + b"\x00")
-        if not candidate.parent.resolve().is_relative_to(worktree.resolve()):
-            raise DevAgentError("Cannot snapshot a source path through an external symlink")
-        if candidate.is_symlink():
-            digest.update(
-                b"symlink\x00" + hashlib.sha256(os.fsencode(os.readlink(candidate))).digest()
-            )
-        elif candidate.is_file():
-            digest.update(f"{candidate.stat().st_mode & 0o777}:".encode())
-            content = hashlib.sha256()
-            with candidate.open("rb") as stream:
-                while chunk := stream.read(1024 * 1024):
-                    content.update(chunk)
-            digest.update(content.digest())
-        elif candidate.exists():
-            raise DevAgentError(
-                "Source snapshots do not support submodules or special source files"
-            )
-        else:
-            digest.update(b"missing")
+        digest.update(fingerprint_entry(worktree, name))
         digest.update(b"\x00")
     return {
         "head_commit": head,
         "fingerprint": digest.hexdigest(),
         "index_sha256": hashlib.sha256(index).hexdigest(),
         "dirty": bool(status(worktree)),
-        "dirty_including_ignored": bool(status(worktree, ignored=True)),
+        "dirty_including_ignored": bool(
+            git(worktree, "status", "--porcelain=v1", "-z", "--ignored=matching", "-unormal").stdout
+        ),
         "scope": "HEAD, index, tracked and nonignored untracked contents/modes; "
         "ignored files excluded",
         "captured_at": now(),

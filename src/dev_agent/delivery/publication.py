@@ -23,8 +23,11 @@ from dev_agent.integrations.github import GitHub, GitHubError, ci_observation
 from dev_agent.records import RunRecord, Store, atomic_json, atomic_write, new_id, now
 from dev_agent.reporting.results import export_results
 from dev_agent.repository.git import (
+    changed_files,
     git,
+    ignored_paths,
     output,
+    source_paths,
     source_state,
     validate_managed_worktree,
     validate_repository,
@@ -110,17 +113,17 @@ def validate_origin(worktree: Path, expected: str) -> None:
 
 def source_content(worktree: Path, audit: RunRecord) -> str:
     """Hash audited tracked and nonignored untracked file evidence independently of HEAD."""
-    names = (
-        git(worktree, "ls-files", "-z").stdout
-        + git(worktree, "ls-files", "--others", "--exclude-standard", "-z").stdout
-    )
-    return digest(
-        {
-            os.fsdecode(p): audit[os.fsdecode(p)]
-            for p in set(names.split(b"\0")) - {b""}
-            if os.fsdecode(p) in audit
-        }
-    )
+    source = {}
+    for path in map(os.fsdecode, source_paths(worktree)):
+        if info := audit.get(path):
+            if "sha256" not in info:
+                raise DevAgentError("Source classification changed since content audit")
+            source[path] = info
+        else:
+            candidate = worktree / path
+            if candidate.exists() or candidate.is_symlink():
+                raise DevAgentError("Source appeared after content audit")
+    return digest(source)
 
 
 def excluded_reason(path: str, root: Path, allowed: tuple[str, ...]) -> str | None:
@@ -217,9 +220,9 @@ def pull_body(record: RunRecord, plan: RunRecord) -> str:
     )
 
 
-def validate_implementation_scopes(
-    config: Config, record: RunRecord, bundle: InstructionBundle, audit: RunRecord
-) -> RunRecord:
+def audit_implementation_scopes(
+    config: Config, record: RunRecord, bundle: InstructionBundle
+) -> tuple[RunRecord, RunRecord]:
     """Require the normal pre-supply evidence and recheck current implementation scopes."""
     compliance = record.get("instruction_compliance", {})
     if (
@@ -235,21 +238,24 @@ def validate_implementation_scopes(
         )
     if compliance.get("bundle_sha256") != bundle.provenance()["bundle_sha256"]:
         raise DevAgentError("Baseline instruction policy differs from supplied context")
-    check_documents(bundle, audit, record["approved_scope"])
     before = Store(config.runs_root).directory(record["run_id"]) / "instruction-audit-before.json"
     if before.is_symlink() or not before.is_file() or before.stat().st_size > 64 * 1024 * 1024:
         raise DevAgentError("Original instruction audit is unavailable")
+    previous = json.loads(before.read_text())
+    root = Path(record["worktree"])
+    audit = audit_files(root, config.project(record["project"]).context, previous=previous)
+    check_documents(bundle, audit, record["approved_scope"])
     validation = validate_changes(
         bundle,
         deepcopy(compliance),
-        json.loads(before.read_text()),
+        previous,
         audit,
         record["approved_scope"],
-        Path(record["worktree"]),
+        root,
     )
     if validation["status"] != "validated":
         raise DevAgentError("Current worktree violates mandatory instruction scopes")
-    return validation
+    return audit, validation
 
 
 def publication_plan(
@@ -300,16 +306,16 @@ def publication_plan(
     validate_unstaged_worktree(root)
     current = source_state(root)
     bundle = resolve_project(project, baseline)
-    audit = audit_files(root, project.context)
     if kind == "adoption":
         if allow_incomplete_full or incomplete_full_reason:
             raise DevAgentError(
                 "Legacy adoption requires passing full verification without override"
             )
+        audit = audit_files(root, project.context)
         adoption_audit = audit_candidate(project, record, bundle, audit)
         validation = adoption_audit["changes"]
     else:
-        validation = validate_implementation_scopes(config, record, bundle, audit)
+        audit, validation = audit_implementation_scopes(config, record, bundle)
     content = source_content(root, audit)
     prior = record.get("publication", {})
     owned = prior.get("commit_sha")
@@ -334,19 +340,7 @@ def publication_plan(
         legacy_approval = validate_adoption(config, project, record, fingerprint, adoption_audit)
     elif record.get("delivery_id"):
         validate_recorded_review(config, record, fingerprint)
-    names = git(
-        root,
-        "diff",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--no-renames",
-        "--name-only",
-        "-z",
-        baseline,
-        "--",
-    ).stdout
-    names += git(root, "ls-files", "--others", "--exclude-standard", "-z").stdout
-    changed = sorted({os.fsdecode(p) for p in names.split(b"\0") if p})
+    changed = changed_files(root, baseline)
     if not changed:
         raise DevAgentError("No implementation source changes to publish")
     manifest = []
@@ -359,8 +353,13 @@ def publication_plan(
     untracked = set(
         git(root, "ls-files", "--others", "--exclude-standard", "-z").stdout.split(b"\0")
     )
+    ignored_additions = ignored_paths(
+        root, (name for name in changed if name not in baseline_paths)
+    )
     for name in changed:
         reason = excluded_reason(name, root, project.github.allowed_paths)
+        if name in ignored_additions:
+            reason = "new source matches Git ignore rules"
         if reason:
             excluded.append({"path": name, "reason": reason})
         info = audit.get(name)
@@ -575,12 +574,16 @@ def validate_staging(root: Path, manifest: list[RunRecord]) -> None:
     }
     if staged != {f["path"] for f in manifest}:
         raise DevAgentError("Staged file list does not exactly match the approved manifest")
+    if ignored_paths(root, (item["path"] for item in manifest if item["change"] == "added")):
+        raise DevAgentError("New ignored paths cannot be staged for publication")
     for item in manifest:
-        if item["sha256"] is not None:
+        entry = git(root, "ls-files", "--stage", "--", ":(literal)" + item["path"]).stdout
+        if item["change"] == "deleted":
+            if entry:
+                raise DevAgentError("Staged path expected to be deleted is still in the index")
+        else:
             content = git(root, "show", ":" + item["path"]).stdout
-            mode = git(root, "ls-files", "--stage", "--", ":(literal)" + item["path"]).stdout.split(
-                b" ", 1
-            )[0]
+            mode = entry.split(b" ", 1)[0]
             expected = b"100755" if item["mode"] & 0o111 else b"100644"
             if hashlib.sha256(content).hexdigest() != item["sha256"] or mode != expected:
                 raise DevAgentError(

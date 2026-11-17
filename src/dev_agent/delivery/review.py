@@ -16,7 +16,7 @@ from dev_agent.investigation.validation import _validate, strict_object
 from dev_agent.providers.runner import AgentRunner, read_only_runner
 from dev_agent.records import RunRecord, Store, atomic_json, new_id, now
 from dev_agent.reporting.results import export_results
-from dev_agent.repository.git import git, source_state, validate_managed_worktree
+from dev_agent.repository.git import source_paths, source_state, validate_managed_worktree
 from dev_agent.repository.instructions import (
     InstructionBundle,
     applicable_sets,
@@ -202,12 +202,8 @@ def review(
             check_documents(bundle, before_audit, record["approved_scope"])
             compliance = bundle.provenance()
             state["instruction_compliance"] = compliance
-            paths = (
-                git(root, "ls-files", "-z").stdout
-                + git(root, "ls-files", "--others", "--exclude-standard", "-z").stdout
-            )
             files = sorted(
-                {os.fsdecode(p) for p in paths.split(b"\0") if p and os.fsdecode(p) in before_audit}
+                name for name in map(os.fsdecode, source_paths(root)) if name in before_audit
             )
             if len(files) > project.investigation.max_snapshot_files:
                 raise DevAgentError("Candidate review snapshot exceeds file limit")
@@ -215,7 +211,7 @@ def review(
             total = 0
             for name in files:
                 info = before_audit.get(name, {})
-                if excluded(name) or info.get("type") != "file":
+                if excluded(name) or info.get("type") != "file" or "sha256" not in info:
                     raise DevAgentError("Candidate source contains an unsafe review path")
                 source = root / name
                 if not source.parent.resolve().is_relative_to(root) or source.is_symlink():

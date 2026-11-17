@@ -57,8 +57,11 @@ the controller and where current production execution stops.
 5. **Instructions and verification.** The committed root `AGENTS.md` is mandatory.
    The resolver discovers the nested hierarchy in Git objects, loads a bounded
    bundle, records hashes and validates applicable ancestor chains for changed or
-   cited paths. A scoped audit includes ignored files and rejects changes to
-   mandatory instruction authority. This enforces context supply and path scope.
+   cited paths. A scoped audit hashes Git-indexed and non-ignored untracked
+   files, including indexed files that match an ignore rule. It checks ignored
+   paths with bounded metadata for scope changes and unexpected instructions.
+   The byte limit applies to content reads. This enforces context supply,
+   path scope and baseline instruction authority.
    Individual tool calls and semantic obedience are outside the evidence.
    Verification separately records prerequisite and command results, config digest
    and before/after fingerprints. Delivery requires both profiles to pass for the
@@ -71,7 +74,8 @@ the controller and where current production execution stops.
 7. **Publication.** The preview validates worktree identity, source-bound evidence,
    instruction compliance, applicable review evidence, staging scope and remote
    destination. With explicit confirmation, it stages the approved manifest,
-   checks blob hashes and modes, commits in the retained task worktree, pushes
+   checks blob hashes and modes, refuses newly added paths that match Git ignore
+   rules, commits in the retained task worktree, pushes
    that branch without force, and creates or reuses the draft PR. Existing
    workflows might run as a consequence of the push or PR. Merge is manual.
 8. **CI monitoring and report.** CI records check runs and statuses for the
@@ -151,7 +155,7 @@ flowchart TD
     Prepare -->|Required commands passed; retain optional warnings| Prerequisites{"Declared prerequisites available?"}
     Prepare -->|Exception or interruption| Abort
     Prerequisites -->|No| EnvFailed
-    Prerequisites -->|Yes| InstructionGate["Audit worktree including ignored files;<br/>check baseline context and supply complete scoped bundle"]
+    Prerequisites -->|Yes| InstructionGate["Audit Git-visible source and ignored-path metadata;<br/>check baseline context and supply complete scoped bundle"]
     InstructionGate -->|Failure| InstructionFailed["instructions_failed; no accepted implementation"]
     InstructionGate -->|Ready| Codex["Run restricted codex exec in the worktree;<br/>capture events, stderr and final response"]
     Codex -->|Accepted completion| AgentPassed["Record agent_completed"]

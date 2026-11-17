@@ -197,6 +197,53 @@ def test_dirty_source_and_ignored_files_preserved(publishing: Publishing) -> Non
     assert "ignored/auth.json" not in output(root, "show", "--format=", "--name-only", "HEAD")
 
 
+def test_force_added_ignored_file_cannot_enter_publication(publishing: Publishing) -> None:
+    """Reject a force-added file even when its staged blob matches the supplied manifest."""
+    import hashlib
+
+    from dev_agent.delivery.publication import validate_staging
+
+    config, record, root, state = publishing
+    exclude = Path(
+        output(root, "rev-parse", "--path-format=absolute", "--git-path", "info/exclude")
+    )
+    with exclude.open("a") as stream:
+        stream.write("\nsrc/generated/\n")
+    path = root / "src/generated/source.py"
+    path.parent.mkdir(parents=True)
+    content = b"ignored file under an allowlisted directory\n"
+    path.write_bytes(content)
+    git(root, "add", "-f", "src/generated/source.py")
+
+    with pytest.raises(DevAgentError, match="Existing staged changes"):
+        publish_run(config, record["run_id"], confirmed=True)
+    manifest = [
+        {
+            "path": "src/generated/source.py",
+            "change": "added",
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "mode": path.stat().st_mode,
+        }
+    ]
+    with pytest.raises(DevAgentError, match="New ignored paths"):
+        validate_staging(root, manifest)
+    assert not json.loads(state.read_text()).get("pushes")
+
+
+def test_baseline_tracked_file_stays_publishable_when_ignored(publishing: Publishing) -> None:
+    """Apply the ignored-addition guard without excluding existing tracked source."""
+    config, record, root, _ = publishing
+    exclude = Path(
+        output(root, "rev-parse", "--path-format=absolute", "--git-path", "info/exclude")
+    )
+    with exclude.open("a") as stream:
+        stream.write("\nhello.py\n")
+    result = publish_run(config, record["run_id"], confirmed=True)
+    assert result["publication"]["status"] == "published"
+    files = result["publication"]["approved_plan"]["approved_files"]
+    assert any(f["path"] == "hello.py" and f["change"] == "modified" for f in files)
+
+
 @pytest.mark.parametrize(
     "ci,expected",
     [

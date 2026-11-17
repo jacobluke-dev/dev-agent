@@ -49,6 +49,10 @@ def test_legacy_adoption_approval_and_publication_recovery(legacy: LegacyFixture
     (config, record, root, remote), reviewer, original = legacy
     store = Store(config.runs_root)
     run_id = record["run_id"]
+    dependency = root / "ignored/.venv/sparse.bin"
+    dependency.parent.mkdir(parents=True)
+    with dependency.open("wb") as stream:
+        stream.truncate(3 * 1024**3)
     state = source_state(root)["fingerprint"]
     trees = worktrees(config.project("example").repository)
     adoption = adopt(config, run_id)
@@ -88,6 +92,7 @@ def test_legacy_adoption_approval_and_publication_recovery(legacy: LegacyFixture
     assert fake["pushes"] == 1
     assert sum(c[:2] == ["pr", "create"] for c in fake["calls"]) == 2
     assert (store.directory(run_id) / "record.json").read_bytes() == original
+    assert dependency.stat().st_size == 3 * 1024**3
 
 
 def test_full_failure_and_retry(legacy: LegacyFixture, tmp_path: Path) -> None:
