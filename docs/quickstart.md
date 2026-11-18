@@ -117,6 +117,10 @@ argv = ["uv", "sync", "--locked"]
 cwd = "."
 timeout_seconds = 600
 
+[projects.example.preparation_cache]
+inputs = ["pyproject.toml", "uv.lock"]
+outputs = [".venv/pyvenv.cfg", ".venv/bin/pytest"]
+
 [[projects.example.verification_profiles.targeted]]
 name = "unit-tests"
 argv = ["uv", "run", "pytest", "tests/unit"]
@@ -149,11 +153,13 @@ within it. Use the managed project's actual verification commands and declare
 their prerequisites. If the project needs a database, configure an isolated
 test instance and keep credentials out of the TOML and worktree.
 
-The setup commands install dependencies in the new worktree and may contact
-registries or execute project package scripts. Review the repository and lockfiles
-before running them. Configure any additional project-specific test prerequisites
-in external TOML. On a retained run, `verify --prepare` opts into those same
-setup commands. Without it, verification uses the environment already present.
+Configure all setup commands and test prerequisites in external TOML. Dev Agent
+runs the configured setup before implementation and before pending checks in
+delivery or adoption. Commands may contact registries or execute project package
+scripts. Review the repository and lockfiles before enabling them. The optional
+cache uses recorded success, file hashes and installed output files to avoid
+another install. Adapt those paths to your toolchain. Standalone `verify` uses
+the existing environment by default. `verify --prepare` explicitly forces setup.
 
 Agent, setup, verification and CI monitoring each have their own timeout.
 `agent.model` and `agent.reasoning_effort` are passed to Codex when supplied.
@@ -318,8 +324,9 @@ Dev Agent uses the brief only when its hash matches the original run. If that
 file is unavailable, point to a successful investigation of the same Jira
 ticket and project with `--requirements-run INVESTIGATION-RUN-ID`. This reuses
 the recorded, integrity-checked snapshot and requires no task file. If neither
-source is available, adoption stops. To run trusted setup before the first
-pending check, add `--prepare`. The audit hashes Git-visible source and inspects
+source is available, adoption stops. Adoption runs configured setup automatically
+before pending verification. Add `--prepare` to force setup for the first
+pending check. The audit hashes Git-visible source and inspects
 ignored paths for scope and instruction changes. Ignored dependency contents
 do not consume the adoption byte budget. Eligible content and inspected path
 counts must fit the configured audit limits.
@@ -386,7 +393,7 @@ findings. There is no standalone `review` command.
 | `--scope PATH` | `implement` | Optional and repeatable. Selects literal baseline files or directories. An explicit list replaces the configured scope. Globs and paths outside the repository are invalid. |
 | `--verification {targeted,full,legacy}` | `implement` | Optional. Defaults to targeted if configured, otherwise legacy. Chooses trusted checks to run after implementation. |
 | `--profile {targeted,full,legacy}` | `verify` | Optional. Defaults to targeted if configured, otherwise legacy. Chooses a check profile only. |
-| `--prepare` | `verify`, `adopt` | Off by default. Runs configured setup in the retained worktree. Adoption runs setup before its first pending check and disallows it during legacy acceptance. Trusted commands may install dependencies or use the network. |
+| `--prepare` | `verify`, `adopt` | Off by default. Forces configured setup in the retained worktree. Adoption normally ensures setup automatically. The flag forces its first pending check to run setup and is disallowed during legacy acceptance. Trusted commands may install dependencies or use the network. |
 | `--requirements-run INVESTIGATION-RUN-ID` | `adopt` | Optional. Uses the saved requirements snapshot from the same project's successful investigation. By default, adoption looks for the exact original brief. |
 | `--accept-legacy APPROVAL-SHA256` | `adopt` | Optional. Records operator acceptance of missing historical instruction evidence for the previously qualified candidate. Separate from `--prepare`, `--requirements-run` and publication confirmation. |
 | `--draft` | `publish`, `deliver` | Required. Selects the supported PR mode. Requires `--confirm` before publication mutations. |

@@ -254,7 +254,8 @@ validation; Python dataclass/internal record fields are not TOML options.
 | `worktree_root` | Required | Parent directory for per-run worktrees. |
 | `env` | Optional; empty string-value table | Explicit environment for trusted setup/check processes. |
 | `inherit_env` | Optional; empty name array | Explicitly inherit named invoking-process variables for trusted setup/check processes. |
-| `preparation` | Optional; empty command array | Ordered setup, before agent execution. |
+| `preparation` | Optional; empty command array | Ordered trusted setup before implementation and pending delivery/adoption verification. |
+| `preparation_cache` | Optional; disabled when absent | `[projects.NAME.preparation_cache]` declares `inputs` and `outputs` for reusing successful setup on a retained worktree. |
 | `prerequisites` | Optional; empty table | Project-wide `env`, `paths` and `executables` arrays. |
 | `verification_profiles` | Optional; empty table | Only `targeted` and `full` command arrays are accepted. |
 | `verification` | Optional; empty command array | Backward-compatible `legacy` profile. |
@@ -913,6 +914,12 @@ and command substitution are not interpreted by dev-agent. Configuring a shell,
 interpreter or repository script explicitly is still trusted executable policy;
 its contents can perform arbitrary operations outside the agent sandbox.
 
+Implementation runs setup before Codex starts. Delivery and adoption ensure
+setup before executing pending verification. Successful setup can be shared
+between checks in the same invocation. Standalone `verify --prepare` forces a
+new setup attempt. The orchestrator preserves dependency environments and
+leaves installation behaviour to the configured commands.
+
 Before each setup command, dev-agent validates worktree identity, the command's
 working directory and declared command requirements. Project-wide path/env/tool
 prerequisites are checked after setup, so setup can create required files first.
@@ -928,8 +935,34 @@ stdout/stderr log paths, timeout and status. Unperformed commands stay `not_run`
 | Required setup command reports failure or timeout | Stop setup, do not start an agent implementation session, record `environment_failed`, preserve the worktree and export results; normally exit 6. Codex help/version preflight has already occurred. |
 | Optional setup command reports failure | Continue when prerequisites allow; record `optional_failed`. Otherwise passing implementation/checks become `passed_with_warnings`, exit 4. |
 | No setup commands | Preparation is `skipped`; prerequisites are still checked. |
+| Earlier successful setup is current | Record `reused` and the reason. Verification and source integrity checks still run when pending. |
 | Declared prerequisites missing | Record their names/paths/tools as evidence; do not treat unavailable checks as passes. |
 | Interruption or orchestration exception | Stop remaining steps; attempt to persist interrupted/error evidence. Optional status does not override an orchestration error. |
+
+For reuse across separate invocations, declare the lockfiles, manifests or
+toolchain pins that determine installation and representative installed files:
+
+```toml
+[projects.example.preparation_cache]
+inputs = ["pyproject.toml", "uv.lock"]
+outputs = [".venv/pyvenv.cfg", ".venv/bin/pytest"]
+```
+
+Both lists must contain 1–64 literal, worktree-relative file paths. Reuse needs
+a successful canonical record for the same worktree, matching hashes of the
+inputs, matching setup commands and effective environment, and matching setup
+executable and output file identities. Missing, unsafe or oversized inputs
+prevent reuse. Input hashing is limited to 32 MiB total. Declare all relevant
+dependency inputs and runtime pin files, and use actual installed files as
+outputs. An environment directory or an output file on its own is insufficient.
+These checks establish that the recorded setup still matches the declared
+evidence. They do not independently test the entire toolchain or dependency tree.
+
+Automatic preparation during verification stops if setup changes the candidate
+source. Inspect those changes before retrying. A failed or interrupted setup
+is retained in the run record. A later `adopt` or `deliver --resume` can retry a
+confirmed failure or interruption. If an attempt was left `running`, inspect
+any surviving process before forcing preparation or starting a new execution.
 
 Timeout handling sends termination to the child process group, then kills remaining
 descendants after a short grace period. It does not retry or repair. Ctrl-C/SIGTERM
@@ -1245,8 +1278,9 @@ Resumption validates project/ticket identity, original configuration, baseline,
 artifact hashes and child linkage. An execution lock excludes concurrent delivery
 invocations. It does not silently adopt a historical implementation by ticket key,
 regenerate changed briefs, start another implementation agent, or invent missing
-history. Incomplete/failed implementation checkpoints require explicit inspection;
-there is no unsafe automatic restart after an uncertain agent outcome. Finished
+history. A blocked preparation checkpoint may resume in the same worktree when
+the child record confirms that the implementation agent never started. An
+uncertain agent outcome or an unclosed setup process requires inspection. Finished
 source with fresh checks can proceed. Interrupted read-only review may resume as a
 new recorded attempt; accepted failing findings on unchanged source remain a blocker.
 Publication recovery reuses the existing commit and PR checks rather than creating
