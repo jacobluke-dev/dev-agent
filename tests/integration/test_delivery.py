@@ -362,3 +362,41 @@ def test_invalid_ticket_evidence_stops_before_implementation(
     result = deliver(config, "example", "TASK-42", confirmed=True)
     assert result["outcome"] == "invalid_intake"
     assert result["implementation_run_id"] is None
+
+
+def test_delivery_retries_preparation_before_agent_on_same_checkpoint(
+    delivery_pipeline: DeliveryFixture, tmp_path: Path
+) -> None:
+    """Resume a blocked setup while keeping the child run, worktree and first attempt evidence."""
+    from tests.support.runs import configured, python_check
+
+    (config, _, _, remote), reviewer, intakes = delivery_pipeline
+    gate = tmp_path / "allow-install"
+    check = python_check(
+        "setup",
+        "from pathlib import Path; "
+        f"assert Path({str(gate)!r}).exists(); "
+        "Path('ignored').mkdir(exist_ok=True); f=Path('ignored/setup-count'); "
+        "f.open('a').write('1'); print('installed')",
+    )
+    config = configured(config, preparation=(check,))
+    first = deliver(config, "example", "TASK-42")
+    assert first["outcome"] == "preparation_blocked", first["blockers"]
+    store = Store(config.runs_root)
+    child_id = first["implementation_run_id"]
+    blocked = store.load(child_id)
+    assert blocked["preparation"]["status"] == "failed" and blocked["agent"]["status"] == "pending"
+    root = Path(blocked["worktree"])
+    gate.touch()
+    resumed = deliver(config, "example", "TASK-42", resume=first["run_id"])
+    assert resumed["outcome"] == "awaiting_confirmation", resumed["blockers"]
+    assert resumed["implementation_run_id"] == child_id
+    child = store.load(child_id)
+    assert child["preparation_history"][0]["state"] == blocked["preparation"]
+    assert child["verification_attempts"][-1]["preparation"]["reuse"] == "current_invocation"
+    assert (root / "ignored/setup-count").read_text() == "1"
+    projection = json.loads((Path(child["results_directory"]) / "report.json").read_text())
+    exported = projection["preparation"]["commands"][0]["export_stdout"]
+    assert (Path(child["results_directory"]) / exported).read_text() == "installed\n"
+    assert reviewer.calls == 1 and len(intakes) == 1
+    assert not json.loads(remote.read_text()).get("pushes")

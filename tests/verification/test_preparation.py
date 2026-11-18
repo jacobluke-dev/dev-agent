@@ -296,3 +296,107 @@ def test_configuration_provenance_uses_loaded_snapshot(
     assert record["outcome"] == "passed"
     assert record["configuration_sha256"] == loaded_digest
     assert record["verification_attempts"][0]["configuration_sha256"] == loaded_digest
+
+
+def test_cached_preparation_reuses_success_and_refreshes_changed_inputs(
+    config: Config, repo: Path, prompt: Path
+) -> None:
+    """Retain a prepared environment until declared lockfile or installed file evidence changes."""
+    from dev_agent.config import PreparationCache
+    from dev_agent.repository.git import git
+    from dev_agent.verification.runs import verify
+
+    (repo / "toolchain.lock").write_text("v1")
+    git(repo, "add", "toolchain.lock")
+    git(repo, "commit", "-m", "Synthetic toolchain lockfile")
+    config = configured(
+        config,
+        preparation=(
+            python_check(
+                "install",
+                "from pathlib import Path; p=Path('ignored/installed'); "
+                "p.parent.mkdir(exist_ok=True); "
+                "p.write_text(p.read_text()+'1' if p.exists() else '1')",
+            ),
+        ),
+        preparation_cache=PreparationCache(("toolchain.lock",), ("ignored/installed",)),
+    )
+    record = implement(config, "example", "TASK-123", prompt, runner=runner())
+    root = Path(record["worktree"])
+    marker = root / "ignored/installed"
+    run_id = record["run_id"]
+    assert record["verification_attempts"][-1]["preparation"]["status"] == "reused"
+    again = verify(config, run_id, automatic_preparation=True)
+    assert again["verification_attempts"][-1]["preparation"]["reuse"] == "validated_cache"
+    assert marker.read_text() == "1"
+
+    (root / "toolchain.lock").write_text("v2")
+    again = verify(config, run_id, automatic_preparation=True)
+    assert again["verification_attempts"][-1]["preparation"]["status"] == "passed"
+    assert marker.read_text() == "11"
+    marker.unlink()
+    again = verify(config, run_id, automatic_preparation=True)
+    assert again["verification_attempts"][-1]["preparation"]["status"] == "passed"
+    assert marker.read_text() == "1"
+    forced = verify(config, run_id, prepare_environment=True)
+    assert forced["verification_attempts"][-1]["preparation"]["status"] == "passed"
+    assert marker.read_text() == "11"
+
+
+def test_lockfile_change_during_implementation_refreshes_before_initial_verification(
+    config: Config, repo: Path, prompt: Path
+) -> None:
+    """Prepare the edited dependency graph before the agent's candidate is checked."""
+    from dev_agent.config import PreparationCache
+    from dev_agent.repository.git import git
+
+    (repo / "toolchain.lock").write_text("before")
+    git(repo, "add", "toolchain.lock")
+    git(repo, "commit", "-m", "Synthetic dependency input")
+    config = configured(
+        config,
+        preparation=(
+            python_check(
+                "install",
+                "from pathlib import Path; p=Path('ignored/output'); "
+                "p.parent.mkdir(exist_ok=True); p.write_text(Path('toolchain.lock').read_text())",
+            ),
+        ),
+        preparation_cache=PreparationCache(("toolchain.lock",), ("ignored/output",)),
+        verification=(
+            python_check(
+                "check",
+                "from pathlib import Path; assert Path('ignored/output').read_text() == 'after'",
+            ),
+        ),
+    )
+    agent = runner()
+
+    def change_input(root: Path, *args: object) -> ProcessResult:
+        """Change the fixture lockfile only after the first setup has run."""
+        assert (root / "ignored/output").read_text() == "before"
+        (root / "toolchain.lock").write_text("after")
+        return ProcessResult(0, 0.01)
+
+    agent.run.side_effect = change_input
+    run = implement(config, "example", "TASK-123", prompt, runner=agent)
+    assert run["outcome"] == "passed"
+    assert run["verification_attempts"][0]["preparation"]["status"] == "passed"
+    assert (
+        run["verification_attempts"][0]["preparation"]["fingerprint"]
+        != run["preparation"]["fingerprint"]
+    )
+
+
+def test_preparation_cache_config_is_operator_defined(config_file: Path) -> None:
+    """Parse literal preparation inputs and outputs only from the selected project settings."""
+    original = config_file.read_text()
+    config_file.write_text(
+        original + '\n[projects.example.preparation_cache]\ninputs=["pkg.lock"]\n'
+        'outputs=["generated/ready"]\n'
+    )
+    cache = load_config(config_file).project("example").preparation_cache
+    assert cache.inputs == ("pkg.lock",) and cache.outputs == ("generated/ready",)
+    config_file.write_text(config_file.read_text().replace('"pkg.lock"', '"../pkg.lock"'))
+    with pytest.raises(DevAgentError, match="preparation_cache.inputs"):
+        load_config(config_file)
