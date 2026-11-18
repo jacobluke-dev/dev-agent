@@ -136,6 +136,14 @@ class Prerequisites:
 
 
 @dataclass(frozen=True)
+class PreparationCache:
+    """Name the dependency inputs and installed files needed to reuse preparation."""
+
+    inputs: tuple[str, ...]
+    outputs: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class AtlassianConfig:
     """Describe bounded REST investigation and refer to credentials by environment name."""
 
@@ -212,6 +220,7 @@ class Project:
     context: RepositoryContext = field(default_factory=RepositoryContext)
     investigation: InvestigationConfig = field(default_factory=InvestigationConfig)
     github: GitHubConfig | None = None
+    preparation_cache: PreparationCache | None = None
 
     def checks(self, profile: str | None) -> tuple[str, tuple[Check, ...]]:
         """Resolve a check profile, preferring targeted by default when it is configured.
@@ -294,6 +303,7 @@ def load_config(filename: Path) -> Config:
                 "verification",
                 "agent",
                 "preparation",
+                "preparation_cache",
                 "verification_profiles",
                 "env",
                 "inherit_env",
@@ -359,6 +369,9 @@ def load_config(filename: Path) -> Config:
             parse_context(raw.get("context", {})),
             parse_investigation(raw.get("investigation", {})),
             parse_github(raw["github"]) if "github" in raw else None,
+            parse_preparation_cache(raw["preparation_cache"])
+            if "preparation_cache" in raw
+            else None,
         )
     # Every storage root must be outside every configured source and its Git metadata.
     for project in projects.values():
@@ -416,6 +429,26 @@ def parse_github(value: object) -> GitHubConfig:
         seconds(raw.get("ci_timeout_seconds", 600), "github.ci_timeout_seconds"),
         seconds(raw.get("poll_interval_seconds", 10), "github.poll_interval_seconds"),
     )
+
+
+def parse_preparation_cache(value: object) -> PreparationCache:
+    """Require bounded, literal worktree file paths for both sides of cache validation."""
+    raw = table(value, {"inputs", "outputs"}, "preparation_cache")
+
+    def files(key: str) -> tuple[str, ...]:
+        """Validate one list without assuming a particular package manager."""
+        values = raw.get(key)
+        label = f"preparation_cache.{key}"
+        if not isinstance(values, list) or not 1 <= len(values) <= 64:
+            raise DevAgentError(f"{label} must contain 1-64 literal file paths")
+        paths = tuple(relative_path(path, label) for path in values)
+        if len(set(paths)) != len(paths) or any(
+            path == "." or any(c in path for c in "*?[") for path in paths
+        ):
+            raise DevAgentError(f"{label} must contain unique literal file paths")
+        return paths
+
+    return PreparationCache(files("inputs"), files("outputs"))
 
 
 def parse_commands(value: object, label: str) -> tuple[Check, ...]:

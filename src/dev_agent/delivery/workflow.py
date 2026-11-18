@@ -11,7 +11,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from dev_agent.config import Config
-from dev_agent.delivery.implementation import implement
+from dev_agent.delivery.implementation import can_resume_preparation, implement
 from dev_agent.delivery.publication import ci_run, publish_run
 from dev_agent.delivery.review import review
 from dev_agent.errors import DevAgentError
@@ -22,7 +22,7 @@ from dev_agent.reporting.delivery import export_delivery
 from dev_agent.repository.git import source_state, validate_managed_worktree, validate_repository
 from dev_agent.repository.instructions import InstructionBundle, resolve_project
 from dev_agent.repository.snapshot import materialize
-from dev_agent.verification.runs import verify
+from dev_agent.verification.runs import latest_preparation, preparation_blocked, verify
 
 MCP_BLOCKER = (
     "Codex Atlassian MCP delivery is unavailable: the isolated catalogue reported notLoggedIn; "
@@ -356,8 +356,10 @@ def deliver(
                 stage("implementation_reserved")
             child_id = record["implementation_run_id"]
             child_dir = store.directory(child_id)
-            if not child_dir.exists():
-                stage("implementing")
+            child = store.load(child_id) if child_dir.exists() else None
+            starting_here = child is None or can_resume_preparation(child)
+            if starting_here:
+                stage("resuming_preparation" if child is not None else "implementing")
                 child = implement(
                     config,
                     project_name,
@@ -368,9 +370,8 @@ def deliver(
                     delivery_id=record["run_id"],
                     expected_baseline=baseline.commit,
                     progress=progress,
+                    resume_preparation=child is not None,
                 )
-            else:
-                child = store.load(child_id)
             if (
                 child.get("delivery_id") != record["run_id"]
                 or child.get("task") != task
@@ -384,6 +385,11 @@ def deliver(
                 child.get("phase") != "finished"
                 or child.get("implementation_status") != "agent_completed"
             ):
+                if can_resume_preparation(child):
+                    raise DeliveryBlocked(
+                        "preparation_blocked",
+                        "Implementation preparation incomplete; inspect the child run and resume",
+                    )
                 raise DeliveryBlocked(
                     "implementation_blocked",
                     "Implementation incomplete/failed; inspect its run ID. "
@@ -394,15 +400,27 @@ def deliver(
                     "instructions_failed", "Implementation instruction enforcement did not pass"
                 )
             if not child.get("publication", {}).get("commit_sha"):
+                prepared_here = latest_preparation(child) if starting_here else None
                 for profile in ("targeted", "full"):
                     attempts = [
                         a
                         for a in child.get("verification_attempts", [])
                         if a.get("profile") == profile
                     ]
-                    if not attempts:
+                    if not attempts or (
+                        not starting_here
+                        and preparation_blocked(attempts[-1])
+                        and attempts[-1].get("status") != "preparation_changed_source"
+                    ):
                         stage("verifying_" + profile)
-                        child = verify(config, child_id, profile)
+                        child = verify(
+                            config,
+                            child_id,
+                            profile,
+                            automatic_preparation=True,
+                            prepared_here=prepared_here,
+                        )
+                        prepared_here = latest_preparation(child)
                         attempts = [
                             a for a in child["verification_attempts"] if a["profile"] == profile
                         ]
@@ -412,6 +430,11 @@ def deliver(
                         latest.get("status") != "passed"
                         or latest.get("source_after", {}).get("fingerprint") != fingerprint
                     ):
+                        if preparation_blocked(latest):
+                            raise DeliveryBlocked(
+                                "preparation_blocked",
+                                f"{profile} setup or prerequisites failed; inspect and resume",
+                            )
                         raise DeliveryBlocked(
                             "verification_blocked",
                             "Current " + profile + " verification has not passed; "

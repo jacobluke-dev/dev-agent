@@ -24,6 +24,8 @@ def verification_attempt(
     *,
     initial: bool = False,
     prepare_environment: bool = False,
+    automatic_preparation: bool = False,
+    prepared_here: RunRecord | None = None,
 ) -> RunRecord:
     """Append and execute one verification attempt for the current managed worktree.
 
@@ -33,6 +35,8 @@ def verification_attempt(
         profile: Check profile name or None for the project default.
         initial: Reuse initial check records and capture the original source fingerprint.
         prepare_environment: Explicitly run setup for this verification attempt.
+        automatic_preparation: Ensure setup for an orchestrated check and reject source edits.
+        prepared_here: Successful setup from the current workflow invocation, if available.
 
     Returns:
         The mutable attempt record, including before and after evidence, command outcomes and
@@ -47,6 +51,7 @@ def verification_attempt(
         raise DevAgentError("Verification storage must not contain symlinks")
     directory.parent.mkdir(exist_ok=True, mode=0o700)
     directory.mkdir(mode=0o700)
+    previous = latest_preparation(record)
     attempt = {
         "attempt_id": directory.name,
         "profile": profile,
@@ -77,18 +82,46 @@ def verification_attempt(
     save()
     try:
         attempt["source_requested"] = source_state(worktree)
-        if prepare_environment:
+        if prepare_environment or automatic_preparation:
             attempt["phase"] = "preparing"
             if not prepare(
-                project, worktree, attempt["preparation"], directory / "preparation", save, validate
+                project,
+                worktree,
+                attempt["preparation"],
+                directory / "preparation",
+                save,
+                validate,
+                previous=previous,
+                prepared_here=prepared_here,
+                force=prepare_environment,
             ):
-                attempt.update(status="environment_failed", outcome="environment_failed")
+                missing = any(
+                    check["required"] and check.get("failure_kind") == "missing_prerequisite"
+                    for check in attempt["preparation"]["commands"]
+                )
+                attempt.update(
+                    status="missing_prerequisite" if missing else "environment_failed",
+                    outcome="environment_failed",
+                )
+                if error := attempt["preparation"].get("error"):
+                    attempt["error"] = error
                 return attempt
+        source = source_state(worktree)
+        if (
+            automatic_preparation
+            and source["fingerprint"] != attempt["source_requested"]["fingerprint"]
+        ):
+            attempt.update(
+                status="preparation_changed_source",
+                outcome="environment_failed",
+                error="Automatic preparation changed candidate source; review before retrying",
+            )
+            return attempt
         attempt["prerequisites"] = prerequisites(project, worktree, checks)
         if attempt["prerequisites"]["status"] != "passed":
             attempt.update(status="missing_prerequisite", outcome="environment_failed")
             return attempt
-        attempt["source_before"] = source_state(worktree)
+        attempt["source_before"] = source
         attempt["files_changed"] = changed_files(worktree, record["baseline_commit"])
         if initial:
             record["implementation_source"] = attempt["source_before"]
@@ -163,12 +196,18 @@ def verification_attempt(
 
 
 def verify(
-    config: Config, run_id: str, profile: str | None = None, *, prepare_environment: bool = False
+    config: Config,
+    run_id: str,
+    profile: str | None = None,
+    *,
+    prepare_environment: bool = False,
+    automatic_preparation: bool = False,
+    prepared_here: RunRecord | None = None,
 ) -> RunRecord:
     """Lock a retained implementation run and append a new verification attempt.
 
     Preserve the original outcome and agent evidence. Refuse cleaned runs and other run kinds.
-    Setup only reruns when explicitly requested.
+    Standalone verification requires explicit setup. Orchestrated callers can ensure it.
     """
     store = Store(config.runs_root)
     with store.lock(run_id):
@@ -189,9 +228,32 @@ def verify(
         project = validate_managed_worktree(config, record)
         project.checks(profile)  # Refuse an unknown profile before appending an attempt.
         reserve_results(config, record)
-        verification_attempt(config, record, profile, prepare_environment=prepare_environment)
+        verification_attempt(
+            config,
+            record,
+            profile,
+            prepare_environment=prepare_environment,
+            automatic_preparation=automatic_preparation,
+            prepared_here=prepared_here,
+        )
         save_with_results(config, record, store, preserve_original=True)
         return record
+
+
+def latest_preparation(record: RunRecord) -> RunRecord | None:
+    """Find the latest actual setup state without overlooking a failure or interruption."""
+    for attempt in reversed(record.get("verification_attempts", [])):
+        state = attempt.get("preparation", {})
+        if state.get("status") not in (None, "not_run", "skipped"):
+            return state
+    return record.get("preparation")
+
+
+def preparation_blocked(attempt: RunRecord) -> bool:
+    """Recognise an attempt stopped before its checks by setup or missing prerequisites."""
+    return attempt.get("outcome") == "environment_failed" or attempt.get("preparation", {}).get(
+        "status"
+    ) in ("running", "interrupted", "error", "failed")
 
 
 def verification_evidence(

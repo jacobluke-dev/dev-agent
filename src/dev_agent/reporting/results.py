@@ -115,6 +115,8 @@ def summary(record: RunRecord, directory: Path) -> str:
     lines += ["", "## Preparation", ""]
     failures = []
     groups = [("Original preparation", record.get("preparation", {}).get("commands", []))]
+    for prior in record.get("preparation_history", []):
+        groups.append((f"Earlier preparation {prior['attempt_id']}", prior["state"]["commands"]))
     for attempt in attempts:
         commands = attempt.get("preparation", {}).get("commands", [])
         if commands:
@@ -166,6 +168,8 @@ def summary(record: RunRecord, directory: Path) -> str:
             failures.append(attempt["error"])
         if attempt.get("comparison_note"):
             lines.append(f"- Source comparison: {inline(attempt['comparison_note'])}")
+        if preparation := attempt.get("preparation"):
+            lines.append(f"- Preparation: {inline(preparation['status'])}")
     failures += record.get("prerequisites", {}).get("failures", [])
     for key in ("error", "inspection_error", "results_error"):
         if record.get(key):
@@ -277,7 +281,15 @@ def export_results(config: Config, record: RunRecord) -> Path:
             atomic_write(directory / name, b"")
     # Add export links to a copy; canonical evidence does not contain presentation paths.
     projection = json.loads(json.dumps(record))
-    groups = [("preparation", projection.get("preparation", {}).get("commands", []))]
+    setup = projection.get("preparation", {})
+    setup_directory = "preparation"
+    if attempt_id := setup.get("attempt_id"):
+        identifier(attempt_id, "preparation attempt ID")
+        setup_directory += f"/{attempt_id}"
+    groups = [(setup_directory, setup.get("commands", []))]
+    for prior in projection.get("preparation_history", []):
+        identifier(prior["attempt_id"], "preparation attempt ID")
+        groups.append((f"preparation/history/{prior['attempt_id']}", prior["state"]["commands"]))
     if not projection.get("verification_attempts") or projection.get("schema_version") == 1:
         groups.append(("verification/original", projection.get("verification", [])))
     for attempt in projection.get("verification_attempts", []):

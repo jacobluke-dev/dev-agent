@@ -31,7 +31,11 @@ from dev_agent.repository.instructions import (
     resolve_project,
     validate_changed_paths,
 )
-from dev_agent.verification.runs import verification_attempt, verification_evidence
+from dev_agent.verification.runs import (
+    preparation_blocked,
+    verification_attempt,
+    verification_evidence,
+)
 
 IDENTITY_FIELDS = (
     "task",
@@ -349,13 +353,27 @@ def qualify(config: Config, project: Project, record: RunRecord, *, prepare: boo
     candidate = adoption["candidate"]
     source = candidate["fingerprint"]
     root = Path(record["worktree"])
+    prepared_here = None
     for profile in ("targeted", "full"):
         check = candidate_checks(config, project, record)[profile]
         if check["status"] != "passed":
-            attempt = verification_attempt(config, record, profile, prepare_environment=prepare)
+            attempt = verification_attempt(
+                config,
+                record,
+                profile,
+                prepare_environment=prepare,
+                automatic_preparation=True,
+                prepared_here=prepared_here,
+            )
             prepare = False
+            prepared_here = attempt["preparation"]
             if attempt["status"] != "passed" or source_state(root)["fingerprint"] != source:
-                adoption.update(status="verification_blocked", blocked_profile=profile)
+                adoption.update(
+                    status="preparation_blocked"
+                    if preparation_blocked(attempt)
+                    else "verification_blocked",
+                    blocked_profile=profile,
+                )
                 return
     adoption.pop("blocked_profile", None)
     adoption["status"] = "reviewing"
@@ -401,6 +419,7 @@ def summary(record: RunRecord) -> RunRecord:
         "blocked_profile": adoption.get("blocked_profile"),
         "verification": [
             {key: attempt.get(key) for key in ("attempt_id", "profile", "status", "outcome")}
+            | {"preparation": attempt.get("preparation", {}).get("status", "not_run")}
             for attempt in record["verification_attempts"]
         ],
         "review": record.get("independent_review", {}).get("status", "not_run"),

@@ -4,16 +4,22 @@ Commands run with a scoped subprocess environment and worktree-relative location
 supplies identity validation. Configured environment values remain out of command metadata.
 """
 
+import hashlib
+import json
 import os
 import shutil
+import stat
 import time
 from collections.abc import Callable
+from dataclasses import asdict
 from pathlib import Path
 
 from dev_agent.config import Check, Project, relative_path
 from dev_agent.errors import DevAgentError
 from dev_agent.process import ProcessInterrupted, environment, execute
 from dev_agent.records import RunRecord, now
+
+MAX_PREPARATION_INPUT_BYTES = 32 * 1024 * 1024
 
 
 def contained_path(worktree: Path, relative: str) -> Path:
@@ -174,6 +180,92 @@ def run_command(
         save()
 
 
+def preparation_fingerprint(project: Project, worktree: Path) -> str | None:
+    """Identify configured setup, declared inputs, worktree and resolved executables."""
+    if not project.preparation_cache:
+        return None
+    try:
+        inputs = {}
+        remaining = MAX_PREPARATION_INPUT_BYTES
+        for name in project.preparation_cache.inputs:
+            path = contained_path(worktree, name)
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    return None
+                content = stream.read(remaining + 1)
+            remaining -= len(content)
+            if remaining < 0:
+                return None
+            inputs[name] = hashlib.sha256(content).hexdigest()
+        tools = []
+        for command in project.preparation:
+            cwd = contained_path(worktree, command.cwd)
+            env = command_environment(project, worktree, command)
+            executable = Path(command.argv[0])
+            if "/" in command.argv[0]:
+                path = cwd / executable
+            else:
+                search = os.pathsep.join(
+                    str(cwd / part) for part in env.get("PATH", "").split(os.pathsep)
+                )
+                found = shutil.which(command.argv[0], path=search)
+                if not found:
+                    return None
+                path = Path(found)
+            tools.append([file_identity(path), env])
+        directory = worktree.stat()
+        return private_digest(
+            {
+                "version": 1,
+                "worktree": [str(worktree), directory.st_dev, directory.st_ino],
+                "inputs": inputs,
+                "outputs": project.preparation_cache.outputs,
+                "commands": [asdict(command) for command in project.preparation],
+                "tools": tools,
+            }
+        )
+    except OSError, DevAgentError, ValueError:
+        return None  # Missing or unsafe cache evidence never qualifies for reuse.
+
+
+def file_identity(path: Path) -> list[str | int]:
+    """Return a resolved regular file identity without reading tool or output contents."""
+    target = path.resolve(strict=True)
+    info = target.stat()
+    if not stat.S_ISREG(info.st_mode):
+        raise DevAgentError("Preparation cache evidence must be a file")
+    return [
+        str(target),
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    ]
+
+
+def private_digest(value: object) -> str:
+    """Summarise cache evidence without retaining environment values in the record."""
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def preparation_outputs(project: Project, worktree: Path) -> str | None:
+    """Require declared installed files to exist and retain their recorded identities."""
+    if not project.preparation_cache:
+        return None
+    try:
+        return private_digest(
+            [
+                file_identity(contained_path(worktree, name))
+                for name in project.preparation_cache.outputs
+            ]
+        )
+    except OSError, DevAgentError, ValueError:
+        return None
+
+
 def prepare(
     project: Project,
     worktree: Path,
@@ -181,28 +273,99 @@ def prepare(
     directory: Path,
     save: Callable[[], None],
     validate: Callable[[], object],
+    *,
+    previous: RunRecord | None = None,
+    prepared_here: RunRecord | None = None,
+    force: bool = False,
 ) -> bool:
     """Run configured setup commands in order and checkpoint their progress.
 
     The worktree is revalidated before each command. Return False after a required failure.
-    Optional failures are retained as warnings while later steps may continue.
+    Optional failures are retained as warnings while later steps may continue. Reuse
+    durable success only with matching inputs and outputs, or reuse setup just seen
+    in this invocation when the project has no persistent cache configured.
     """
+    if not project.preparation:
+        state.update(status="skipped", commands=[])
+        save()
+        return True
+    validate()
+    prior = previous or {}
+    if not force and prior.get("status") in ("running", "uncertain"):
+        state.update(
+            status="uncertain",
+            commands=[],
+            error="Previous setup may still be running; inspect it before forcing preparation",
+        )
+        save()
+        return False
+    key = preparation_fingerprint(project, worktree)
+    outputs = preparation_outputs(project, worktree) if key and not force else None
+    try:
+        prerequisites_available = not force and all(
+            contained_path(worktree, command.cwd).is_dir()
+            and not missing_requirements(project, worktree, command, project_requirements=False)
+            for command in project.preparation
+        )
+    except DevAgentError:
+        # Let the normal executor persist the failure against the configured command.
+        prerequisites_available = False
+    if (
+        prerequisites_available
+        and key
+        and outputs
+        and prior.get("status") in ("passed", "reused")
+        and (prior.get("fingerprint") == key and prior.get("outputs_sha256") == outputs)
+    ):
+        state.update(
+            status="reused",
+            commands=[],
+            fingerprint=key,
+            outputs_sha256=outputs,
+            completed_at=prior.get("completed_at"),
+            reuse="validated_cache",
+        )
+        save()
+        return True
+    if (
+        prerequisites_available
+        and not project.preparation_cache
+        and (prepared_here or {}).get("status") in ("passed", "reused")
+    ):
+        state.update(status="reused", commands=[], reuse="current_invocation")
+        save()
+        return True
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     state.update(status="running", commands=[command_record(c) for c in project.preparation])
     save()
-    for command, record in zip(project.preparation, state["commands"], strict=True):
-        validate()
-        run_command(project, worktree, command, record, directory, save, project_requirements=False)
-        if record["status"] != "passed" and command.required:
-            state["status"] = "failed"
-            save()
-            return False
-    state["status"] = (
-        "skipped"
-        if not project.preparation
-        else "optional_failed"
-        if any(c["status"] != "passed" for c in state["commands"])
-        else "passed"
-    )
-    save()
-    return True
+    try:
+        for command, record in zip(project.preparation, state["commands"], strict=True):
+            validate()
+            run_command(
+                project, worktree, command, record, directory, save, project_requirements=False
+            )
+            if record["status"] != "passed" and command.required:
+                state["status"] = "failed"
+                return False
+        state["status"] = (
+            "optional_failed"
+            if any(c["status"] != "passed" for c in state["commands"])
+            else "passed"
+        )
+        if (
+            state["status"] == "passed"
+            and key
+            and preparation_fingerprint(project, worktree) == key
+        ):
+            if outputs := preparation_outputs(project, worktree):
+                state.update(fingerprint=key, outputs_sha256=outputs)
+        return True
+    except KeyboardInterrupt:
+        state["status"] = "interrupted"
+        raise
+    except Exception:
+        state["status"] = "error"
+        raise
+    finally:
+        state["completed_at"] = now()
+        save()

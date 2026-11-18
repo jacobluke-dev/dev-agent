@@ -50,6 +50,7 @@ def plan(
     execution_id: str | None = None,
     delivery_id: str | None = None,
     expected_baseline: str | None = None,
+    retained: bool = False,
 ) -> tuple[RunRecord, str]:
     """Validate the task, baseline and scope, then build a run record and prompt.
 
@@ -82,7 +83,8 @@ def plan(
     Store(config.runs_root).directory(run_id)
     destination = project.worktree_root / run_id
     branch = f"dev-agent/{run_id}"
-    check_destination(project, branch, destination)
+    if not retained:
+        check_destination(project, branch, destination)
     record = {
         "schema_version": 2,
         "delivery_id": delivery_id,
@@ -141,7 +143,7 @@ def plan(
             "Implementation prompt exceeds context.max_prompt_bytes; no truncation permitted",
             bundle,
         )
-    if results_path(config, record).exists():
+    if not retained and results_path(config, record).exists():
         raise DevAgentError("Results directory already exists; refusing to overwrite it")
     record["planned_results_directory"] = str(results_path(config, record))
     return record, prompt
@@ -161,6 +163,7 @@ def implement(
     delivery_id: str | None = None,
     expected_baseline: str | None = None,
     progress: Callable[[str], None] | None = None,
+    resume_preparation: bool = False,
 ) -> RunRecord:
     """Execute a validated implementation plan and retain evidence.
 
@@ -172,6 +175,8 @@ def implement(
         The canonical implementation record, with outcome, verification history and partial
             evidence on failures recorded after execution begins.
     """
+    if resume_preparation and (dry_run or not delivery_id or not execution_id):
+        raise DevAgentError("Preparation resumption requires a delivery implementation checkpoint")
     record, prompt = plan(
         config,
         project_name,
@@ -182,13 +187,18 @@ def implement(
         execution_id=execution_id,
         delivery_id=delivery_id,
         expected_baseline=expected_baseline,
+        retained=resume_preparation,
     )
     if dry_run:
         return record
     runner = runner or implementation_runner()
-    record["agent"].update(runner.preflight())
+    preflight = runner.preflight()
     store = Store(config.runs_root)
-    directory = store.create(record)
+    if resume_preparation:
+        directory = store.directory(record["run_id"])
+    else:
+        record["agent"].update(preflight)
+        directory = store.create(record)
     project = config.project(project_name)
     bundle = resolve_project(project, record["baseline_commit"])
     _, checks = project.checks(record["verification_profile"])
@@ -196,6 +206,38 @@ def implement(
     before = None
     after = None
     with store.lock(record["run_id"]):
+        preparation_directory = directory / "preparation"
+        if resume_preparation:
+            saved = store.load(record["run_id"])
+            if not can_resume_preparation(saved) or any(
+                saved.get(key) != record[key]
+                for key in (
+                    "delivery_id",
+                    "project",
+                    "task",
+                    "configuration_sha256",
+                    "baseline_commit",
+                    "prompt_sha256",
+                    "verification_profile",
+                    "approved_scope",
+                )
+            ):
+                raise DevAgentError("Unsafe implementation preparation checkpoint; inspect the run")
+            validate_managed_worktree(config, saved)
+            if output(worktree, "rev-parse", "HEAD") != saved["baseline_commit"]:
+                raise DevAgentError("Worktree HEAD changed during preparation; inspect the run")
+            record = saved
+            record["agent"].update(preflight)
+            history = record.setdefault("preparation_history", [])
+            history.append(
+                {"attempt_id": new_id("prior-setup", task), "state": record["preparation"]}
+            )
+            attempt_id = new_id("prepare", task)
+            record["preparation"] = {"attempt_id": attempt_id, "status": "not_run", "commands": []}
+            preparation_directory /= attempt_id
+            record.pop("error", None)
+            record.pop("inspection_error", None)
+            record.update(outcome="planned", finished_at=None)
         last_phase = None
 
         def save() -> None:
@@ -211,16 +253,17 @@ def implement(
             return validate_managed_worktree(config, record)
 
         try:
-            atomic_json(directory / "repository-instructions.json", bundle.payload())
             reserve_results(config, record)
-            record.update(started_at=now(), phase="creating_worktree")
-            save()
-            create_worktree(project, record["branch"], worktree, record["baseline_commit"])
-            log(directory, "Worktree created at exact baseline; source checkout preserved")
+            if not resume_preparation:
+                atomic_json(directory / "repository-instructions.json", bundle.payload())
+                record.update(started_at=now(), phase="creating_worktree")
+                save()
+                create_worktree(project, record["branch"], worktree, record["baseline_commit"])
+                log(directory, "Worktree created at exact baseline; source checkout preserved")
             record["phase"] = "preparing"
             save()
             if not prepare(
-                project, worktree, record["preparation"], directory / "preparation", save, validate
+                project, worktree, record["preparation"], preparation_directory, save, validate
             ):
                 record["outcome"] = "environment_failed"
                 return record
@@ -271,7 +314,11 @@ def implement(
             record["phase"] = "verifying"
             save()
             attempt = verification_attempt(
-                config, record, record["verification_profile"], initial=True
+                config,
+                record,
+                record["verification_profile"],
+                initial=True,
+                automatic_preparation=project.preparation_cache is not None,
             )
             record["verification_status"] = (
                 "incomplete"
@@ -357,6 +404,30 @@ def implement(
             log(directory, f"Run finished: {record['outcome']}; worktree retained")
             save_with_results(config, record, store)
     return record
+
+
+def can_resume_preparation(record: RunRecord) -> bool:
+    """Only retry a checkpoint with durable evidence that implementation never began."""
+    agent = record.get("agent", {})
+    return (
+        agent.get("status") == "pending"
+        and record.get("preparation", {}).get("status") != "running"
+        and not agent.get("started_at")
+        and record.get("implementation_status") == "not_run"
+        and not record.get("verification_attempts")
+        and (
+            record.get("phase") == "preparing"
+            or (
+                record.get("outcome")
+                in ("environment_failed", "interrupted", "orchestration_failed")
+                and (
+                    record.get("preparation", {}).get("status")
+                    in ("failed", "error", "interrupted")
+                    or record.get("prerequisites", {}).get("status") == "failed"
+                )
+            )
+        )
+    )
 
 
 def build_prompt(task: str, description: str, instructions: str, checks: list[list[str]]) -> str:
