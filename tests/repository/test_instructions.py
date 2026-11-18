@@ -563,7 +563,7 @@ def test_broad_audit_and_missing_applicable_hash_gate(hierarchy: Path) -> None:
     state = bundle.provenance()
     supplied(bundle, state, bundle.render())
     before = audit_files(hierarchy, RepositoryContext())
-    check_documents(bundle, before)
+    check_documents(bundle, before, worktree=hierarchy)
     file = hierarchy / "frontend/new.py"
     file.write_text("New implementation")
     after = audit_files(hierarchy, RepositoryContext())

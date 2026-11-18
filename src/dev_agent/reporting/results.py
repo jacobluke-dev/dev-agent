@@ -189,7 +189,14 @@ def summary(record: RunRecord, directory: Path) -> str:
             ("Status", publication.get("status")),
             ("Repository", publication.get("repository")),
             ("Published commit", publication.get("commit_sha")),
-            ("Draft PR", publication.get("pr_url")),
+            ("PR mode", publication.get("pr_mode", "draft")),
+            ("Pull request", publication.get("pr_url")),
+            (
+                "Verification policy",
+                publication.get("approved_plan", {})
+                .get("verification_policy", {})
+                .get("mode", "local-full"),
+            ),
             ("Latest CI", (publication.get("ci_observations") or [{}])[-1].get("status")),
             (
                 "Incomplete full verification acknowledgement",

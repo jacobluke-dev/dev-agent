@@ -164,23 +164,28 @@ class GitHub:
             path = item.get("path", "")
             if not re.fullmatch(r"\.github/workflows/[^/]+\.ya?ml", path):
                 continue
-            data = self.api(f"contents/{quote(path, safe='/')}?ref={commit}")
-            try:
-                raw = base64.b64decode(data["content"], validate=False)
-                if len(raw) > 1024 * 1024:
-                    raise ValueError
-                text = raw.decode("utf-8")
-            except KeyError, ValueError, UnicodeError:
-                raise GitHubError("Cannot inspect workflow content safely") from None
+            raw = self.workflow_source(path, commit)
             result.append(
                 {
                     "path": path,
                     "commit": commit,
                     "content_sha256": hashlib.sha256(raw).hexdigest(),
-                    **workflow_triggers(text),
+                    **workflow_triggers(raw.decode("utf-8")),
                 }
             )
         return result
+
+    def workflow_source(self, path: str, commit: str) -> bytes:
+        """Read a bounded UTF-8 workflow file at an immutable GitHub ref."""
+        data = self.api(f"contents/{quote(path, safe='/')}?ref={commit}")
+        try:
+            raw = base64.b64decode(data["content"], validate=False)
+            if len(raw) > 1024 * 1024 or data.get("type", "file") != "file":
+                raise ValueError
+            raw.decode("utf-8")
+            return raw
+        except KeyError, TypeError, ValueError:
+            raise GitHubError("Cannot inspect workflow content safely") from None
 
 
 def workflow_triggers(text: str) -> RunRecord:

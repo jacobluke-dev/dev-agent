@@ -18,6 +18,19 @@ from dev_agent.run_admin import cleanup, inspect_run
 from dev_agent.verification.runs import verify
 
 
+def pr_mode_argument(command: argparse.ArgumentParser) -> None:
+    """Require an explicit publication mode and preserve the legacy draft spelling."""
+    mode = command.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
+        "--draft",
+        dest="pr_mode",
+        action="store_const",
+        const="draft",
+        help="Alias for --pr-mode draft",
+    )
+    mode.add_argument("--pr-mode", choices=("draft", "ready"), help="Select the created PR type")
+
+
 def parser() -> argparse.ArgumentParser:
     """Build the argparse command tree, including required flags and preview options."""
     root = argparse.ArgumentParser(
@@ -71,9 +84,9 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Explicitly run configured preparation before verification",
     )
-    publication = commands.add_parser("publish", help="Preview or confirm draft GitHub publication")
+    publication = commands.add_parser("publish", help="Preview or confirm GitHub PR publication")
     publication.add_argument("run_id")
-    publication.add_argument("--draft", action="store_true", required=True)
+    pr_mode_argument(publication)
     approval = publication.add_mutually_exclusive_group()
     approval.add_argument("--dry-run", action="store_true")
     approval.add_argument("--confirm", action="store_true")
@@ -94,9 +107,9 @@ def parser() -> argparse.ArgumentParser:
     )
     delivery.add_argument("task")
     delivery.add_argument("--project", required=True)
-    delivery.add_argument("--draft", action="store_true", required=True)
+    pr_mode_argument(delivery)
     delivery.add_argument(
-        "--confirm", action="store_true", help="Authorise commit, push and draft PR only"
+        "--confirm", action="store_true", help="Authorise commit, push and the selected PR only"
     )
     delivery.add_argument("--watch", action="store_true")
     delivery.add_argument("--dry-run", action="store_true")
@@ -118,11 +131,6 @@ def dump(value: object) -> None:
     """Print indented, ASCII-escaped JSON for stable terminal inspection."""
     # ASCII escaping also prevents terminal control sequences in filenames/agent errors.
     print(json.dumps(value, indent=2, ensure_ascii=True))
-
-
-def interrupted(signum: int, frame: object) -> None:
-    """Translate SIGTERM into the same interruption path as Ctrl-C."""
-    raise KeyboardInterrupt
 
 
 def exit_code(outcome: str) -> int:
@@ -157,8 +165,20 @@ def main(argv: list[str] | None = None) -> int:
         The command exit code, which can distinguish an incomplete result from a local error.
     """
     args = parser().parse_args(argv)
-    # SIGTERM, like Ctrl-C, gives the orchestrator a chance to stop children and save its record.
-    previous = signal.signal(signal.SIGTERM, interrupted)
+    cancelled = False
+
+    def interrupted(signum: int, frame: object) -> None:
+        """Allow the first cancellation to unwind, including durable evidence and child cleanup."""
+        nonlocal cancelled
+        if not cancelled:
+            cancelled = True
+            raise KeyboardInterrupt
+
+    signals = (signal.SIGINT, signal.SIGTERM)
+    if args.command == "adopt":
+        # A terminal suspension must not freeze adoption while it owns a worktree lock.
+        signals += (signal.SIGTSTP,)
+    previous = {sig: signal.signal(sig, interrupted) for sig in signals}
     try:
         config = load_config(args.config)
         store = Store(config.runs_root)
@@ -170,6 +190,7 @@ def main(argv: list[str] | None = None) -> int:
                         "repository": str(p.repository),
                         "base_branch": p.base_branch,
                         "verification": [c.name for c in p.verification],
+                        "verification_policy": p.verification_policy.evidence(),
                     }
                     for p in config.projects.values()
                 ]
@@ -203,6 +224,8 @@ def main(argv: list[str] | None = None) -> int:
                 accept_legacy=args.accept_legacy,
             )
             dump(summary(record))
+            if record["adoption"]["status"] == "interrupted":
+                return 130
             return (
                 0
                 if record["adoption"]["status"] in ("awaiting_legacy_approval", "approved")
@@ -235,6 +258,7 @@ def main(argv: list[str] | None = None) -> int:
                 watch=args.watch,
                 dry_run=args.dry_run,
                 resume=args.resume,
+                pr_mode=args.pr_mode,
                 progress=progress,
             )
             dump(record if args.dry_run else summary(config, record))
@@ -316,6 +340,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.run_id,
                 confirmed=args.confirm,
                 dry_run=args.dry_run,
+                pr_mode=args.pr_mode,
                 files=tuple(args.file) if args.file else None,
                 title=args.title,
                 summary=args.summary,
@@ -345,4 +370,5 @@ def main(argv: list[str] | None = None) -> int:
         print("dev-agent: interrupted", file=sys.stderr)
         return 130
     finally:
-        signal.signal(signal.SIGTERM, previous)
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)

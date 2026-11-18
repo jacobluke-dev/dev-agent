@@ -9,14 +9,14 @@ import pytest
 from dev_agent.cli import main
 from dev_agent.config import load_config
 from dev_agent.delivery.adoption import adopt
-from dev_agent.delivery.publication import publish_run
+from dev_agent.delivery.publication import ci_run, publish_run
 from dev_agent.errors import DevAgentError
 from dev_agent.integrations.atlassian import content_hash, requirement_units
 from dev_agent.records import Store, atomic_json, new_id, now
 from dev_agent.repository.git import git, source_state, worktrees
 from dev_agent.verification.runs import verify
 from tests.support.investigation import FakeReviewer
-from tests.support.publication import Publishing, state_change
+from tests.support.publication import Publishing, enable_remote_ci, state_change
 from tests.support.publication import publishing as publishing
 
 type LegacyFixture = tuple[Publishing, FakeReviewer, bytes]
@@ -53,6 +53,9 @@ def test_legacy_adoption_approval_and_publication_recovery(legacy: LegacyFixture
     dependency.parent.mkdir(parents=True)
     with dependency.open("wb") as stream:
         stream.truncate(3 * 1024**3)
+    package_rules = root / "ignored/node_modules/next/AGENTS.md"
+    package_rules.parent.mkdir(parents=True)
+    package_rules.write_text("Package-local guidance installed by preparation.")
     state = source_state(root)["fingerprint"]
     trees = worktrees(config.project("example").repository)
     adoption = adopt(config, run_id)
@@ -77,6 +80,9 @@ def test_legacy_adoption_approval_and_publication_recovery(legacy: LegacyFixture
     adopt(config, run_id, accept_legacy=adoption["adoption"]["approval_sha256"])
     preview = publish_run(config, checkpoint, dry_run=True)["plan"]
     assert preview["blockers"] == []
+    assert package_rules.relative_to(root).as_posix() not in {
+        entry["path"] for entry in preview["approved_files"]
+    }
     assert "Historical instruction enforcement was unrecorded" in preview["body"]
     assert not json.loads(remote.read_text()).get("pushes")
     state_change(remote, create_failure=True)
@@ -125,6 +131,80 @@ def test_full_failure_and_retry(legacy: LegacyFixture, tmp_path: Path) -> None:
     assert [a["status"] for a in resumed["verification_attempts"]] == ["passed", "failed", "passed"]
     assert reviewer.calls == 1
     assert not json.loads(remote.read_text()).get("pushes")
+
+
+def test_remote_ci_adoption_requalifies_legacy_source_and_recovers_ready_publication(
+    legacy: LegacyFixture,
+) -> None:
+    """Bind fresh review and targeted evidence to a new policy before a recoverable normal PR."""
+    (local, original, root, remote), reviewer, original_bytes = legacy
+    run_id = original["run_id"]
+    old = adopt(local, run_id)
+    approval = old["adoption"]["approval_sha256"]
+    config = enable_remote_ci(local, remote)
+    with pytest.raises(DevAgentError, match="stale"):
+        adopt(config, run_id, accept_legacy=approval)
+    current = adopt(config, run_id)
+    checkpoint = current["run_id"]
+    assert checkpoint == old["run_id"] and reviewer.calls == 2
+    assert current["adoption"]["historical_instruction_enforcement"] == "not_recorded"
+    assert [a["profile"] for a in current["verification_attempts"]] == [
+        "targeted",
+        "full",
+        "targeted",
+    ]
+    assert current["adoption"]["superseded_candidates"][0]["verification_policy"]["mode"] == (
+        "local-full"
+    )
+    with pytest.raises(DevAgentError, match="explicit legacy approval"):
+        publish_run(config, checkpoint, pr_mode="ready", confirmed=True)
+    adopt(config, run_id, accept_legacy=current["adoption"]["approval_sha256"])
+    blocked = publish_run(config, checkpoint, pr_mode="draft", dry_run=True)["plan"]
+    assert any("draft PR" in reason for reason in blocked["blockers"])
+    plan = publish_run(config, checkpoint, pr_mode="ready", dry_run=True)["plan"]
+    assert not plan["blockers"]
+    assert plan["verification"]["profiles"]["full"]["status"] == "unqualified"
+    assert not json.loads(remote.read_text()).get("pushes")
+    state_change(remote, create_failure=True)
+    failed = publish_run(config, checkpoint, pr_mode="ready", confirmed=True)["publication"]
+    assert failed["failure_phase"] == "pull_request"
+    with pytest.raises(DevAgentError, match="refusing PR conversion"):
+        publish_run(config, checkpoint, pr_mode="draft", confirmed=True)
+    state_change(remote, create_failure=False, checks="absent")
+    final = publish_run(config, checkpoint, pr_mode="ready", confirmed=True, watch=False)[
+        "publication"
+    ]
+    assert failed["commit_sha"] == final["commit_sha"]
+    assert not final["draft"] and final["pr_mode"] == "ready"
+    assert final["ci_observations"][-1]["status"] == "missing"
+    for status in ("pending", "failed", "skipped", "timed_out", "passed"):
+        state_change(remote, checks=status)
+        observation = ci_run(config, checkpoint)
+        assert observation["status"] == status
+        assert observation["commit_sha"] == final["commit_sha"]
+    state_change(remote, check_pr=8)
+    assert ci_run(config, checkpoint)["status"] == "missing"
+    state_change(remote, check_pr=7, job_head="f" * 40)
+    assert ci_run(config, checkpoint)["status"] == "unable_to_retrieve"
+    # A config edit cannot change the meaning of an already published run's CI evidence.
+    state_change(remote, checks="missing_job")
+    assert ci_run(local, checkpoint)["status"] == "missing"
+    state_change(remote, base="e" * 40, checks="passed", job_head=final["commit_sha"])
+    assert ci_run(config, checkpoint)["status"] == "base_mismatch"
+    plan = publish_run(config, checkpoint, pr_mode="ready", dry_run=True)["plan"]
+    assert any("acknowledge-stale-base" in reason for reason in plan["blockers"])
+    reviewed = publish_run(
+        config, checkpoint, pr_mode="ready", acknowledge_stale_base=True, confirmed=True
+    )["publication"]
+    assert reviewed["commit_sha"] == final["commit_sha"]
+    assert reviewed["ci_observations"][-1]["status"] == "passed"
+    data = json.loads(remote.read_text())
+    assert data["pushes"] == 1
+    assert data["pull"]["number"] == 7
+    assert not any(call[:2] in (["pr", "ready"], ["pr", "merge"]) for call in data["calls"])
+    assert (
+        Store(config.runs_root).directory(run_id) / "record.json"
+    ).read_bytes() == original_bytes
 
 
 def test_source_changes_invalidate_approval(legacy: LegacyFixture) -> None:
@@ -298,13 +378,177 @@ def test_adoption_retries_incomplete_automatic_preparation(
         monkeypatch.setattr(commands, "execute", interrupt_install)
     first = adopt(config, original["run_id"])
     failed = first["verification_attempts"][0]
-    assert first["adoption"]["status"] == "preparation_blocked"
+    assert first["adoption"]["status"] == ("interrupted" if interrupted else "preparation_blocked")
     assert failed["preparation"]["status"] == ("interrupted" if interrupted else "failed")
     assert all(check["status"] == "not_run" for check in failed["checks"])
     assert reviewer.calls == 0
+    with Store(config.runs_root).lock(original["run_id"]):
+        pass
     gate.touch()
     second = adopt(config, original["run_id"])
     assert second["adoption"]["status"] == "awaiting_legacy_approval"
     assert second["run_id"] == first["run_id"]
     assert second["verification_attempts"][0] == failed
     assert (root / "ignored/ready").is_file() and reviewer.calls == 1
+
+
+@pytest.mark.parametrize("signame", ["SIGTSTP", "SIGTERM"])
+def test_adoption_cli_cancels_preparation_without_leaving_lock(
+    legacy: LegacyFixture, tmp_path: Path, signame: str
+) -> None:
+    """Cancel a real foreground-style CLI job, reap its installer and save valid evidence."""
+    import os
+    import signal
+    import subprocess
+    import sys
+    import time
+
+    from dev_agent.delivery.adoption import summary
+    from dev_agent.records import adoption_id
+
+    (config, original, _, _), _, history = legacy
+    store = Store(config.runs_root)
+    run_id = original["run_id"]
+    ready = tmp_path / "installer.pid"
+    script = (
+        "import os, signal, time; from pathlib import Path; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        f"Path({str(ready)!r}).write_text(str(os.getpid())); "
+        "time.sleep(30)"
+    )
+    config.path.write_text(
+        config.path.read_text()
+        + '\n[[projects.example.preparation]]\nname = "fixture-install"\n'
+        + f"argv = {json.dumps([sys.executable, '-c', script])}\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "dev_agent", "--config", str(config.path), "adopt", run_id],
+        cwd=tmp_path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        process_group=0,
+    )
+    installer = None
+    try:
+        deadline = time.monotonic() + 15
+        while not ready.exists() or not ready.read_text().strip():
+            assert proc.poll() is None and time.monotonic() < deadline
+            time.sleep(0.01)
+        installer = int(ready.read_text())
+        live = summary(store.load(adoption_id(run_id)))["recorded_in_progress"]
+        assert live["phase"] == "preparing"
+        assert live["command"]["controller_pid"] == proc.pid
+        assert live["command"]["name"] == "fixture-install"
+        assert Path(live["command"]["stderr_log"]).is_file()
+        with pytest.raises(DevAgentError, match=f"Run {run_id} is active"):
+            with store.lock(run_id):
+                pass
+
+        os.killpg(proc.pid, getattr(signal, signame))
+        # Repeated cancellation during the bounded SIGTERM grace period cannot erase evidence.
+        time.sleep(0.15)
+        os.killpg(proc.pid, signal.SIGINT)
+        stdout, stderr = proc.communicate(timeout=10)
+        assert proc.returncode == 130, (stdout, stderr)
+        assert json.loads(stdout)["status"] == "interrupted"
+        assert not Path(f"/proc/{installer}").exists()
+        with store.lock(run_id):
+            state = store.load(adoption_id(run_id))
+        attempt = state["verification_attempts"][-1]
+        assert attempt["outcome"] == "interrupted" and attempt["phase"] == "finished"
+        assert attempt["preparation"]["status"] == "interrupted"
+        command = attempt["preparation"]["commands"][0]
+        assert command["exit_code"] == -signal.SIGKILL
+        assert command["finished_at"] and attempt["finished_at"]
+        assert all(check["status"] == "not_run" for check in attempt["checks"])
+        assert (store.directory(run_id) / "record.json").read_bytes() == history
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+        if installer and Path(f"/proc/{installer}").exists():
+            try:
+                os.killpg(installer, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_adoption_blocks_retry_when_installer_cleanup_is_uncertain(
+    legacy: LegacyFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Release the advisory lock and retain an explicit guard against overlapping setup."""
+    from unittest.mock import Mock
+
+    from dev_agent.process import CLEANUP_ERROR, ProcessResult
+    from tests.support.runs import configured, python_check
+
+    (config, original, _, _), reviewer, _ = legacy
+    config = configured(config, preparation=(python_check("fixture-install", "pass"),))
+    install = Mock(
+        return_value=ProcessResult(
+            None, 0.5, timed_out=True, error=CLEANUP_ERROR, failure_kind="cleanup_incomplete"
+        )
+    )
+    monkeypatch.setattr("dev_agent.verification.commands.execute", install)
+    run_id = original["run_id"]
+    first = adopt(config, run_id)
+    attempt = first["verification_attempts"][-1]
+    assert attempt["preparation"]["status"] == "uncertain"
+    assert attempt["preparation"]["commands"][0]["failure_kind"] == "cleanup_incomplete"
+    assert all(check["status"] == "not_run" for check in attempt["checks"])
+    with Store(config.runs_root).lock(run_id):
+        pass
+    later = adopt(config, run_id)
+    assert later["adoption"]["status"] == "preparation_blocked"
+    assert later["verification_attempts"][-1]["preparation"]["status"] == "uncertain"
+    install.assert_called_once()
+    assert reviewer.calls == 0
+
+
+def test_adoption_reconciles_interrupted_installer_after_empty_refusals(
+    legacy: LegacyFixture, tmp_path: Path
+) -> None:
+    """Recover using the original installer receipt and preserve every prior attempt."""
+    from copy import deepcopy
+
+    from tests.support.runs import configured, python_check
+
+    (config, original, _, _), reviewer, history = legacy
+    gate = tmp_path / "setup-ok"
+    command = python_check(
+        "node-dependencies",
+        f"from pathlib import Path; raise SystemExit(0 if Path({str(gate)!r}).exists() else 1)",
+    )
+    config = configured(config, preparation=(command,))
+    run_id = original["run_id"]
+    first = adopt(config, run_id)
+    stale = first["verification_attempts"][-1]
+    state = stale["preparation"]
+    installer = state["commands"][0]
+    assert installer["process"]["child"]["session"] == installer["process"]["child"]["pid"]
+    # Model the last durable checkpoint before the previous controller died.
+    state["status"] = "running"
+    installer.update(status="running", exit_code=None, finished_at=None)
+    stale.update(phase="preparing", outcome="planned", finished_at=None)
+    refused = deepcopy(stale)
+    refused["attempt_id"] += "-refused"
+    refused.update(phase="finished", outcome="environment_failed")
+    refused["preparation"] = {"status": "uncertain", "commands": []}
+    first["verification_attempts"].append(refused)
+    store = Store(config.runs_root)
+    store.save(first)
+    saved_history = deepcopy(first["verification_attempts"])
+
+    gate.touch()
+    with store.lock(run_id):
+        with pytest.raises(DevAgentError, match="is active"):
+            adopt(config, run_id)
+    resumed = adopt(config, run_id)
+    assert resumed["adoption"]["status"] == "awaiting_legacy_approval"
+    assert resumed["verification_attempts"][: len(saved_history)] == saved_history
+    retry = resumed["verification_attempts"][len(saved_history)]["preparation"]
+    assert retry["recovery"]["decision"] == "retry"
+    assert retry["status"] == "passed"
+    assert reviewer.calls == 1
+    assert (store.directory(run_id) / "record.json").read_bytes() == history

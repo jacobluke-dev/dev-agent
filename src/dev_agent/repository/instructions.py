@@ -15,7 +15,7 @@ from pathlib import Path, PurePosixPath
 from dev_agent.config import Project, RepositoryContext, relative_path
 from dev_agent.errors import DevAgentError
 from dev_agent.records import RunRecord
-from dev_agent.repository.git import git, source_paths
+from dev_agent.repository.git import git, ignored_paths, source_paths
 from dev_agent.repository.snapshot import ContextError, excluded, tree_entries
 
 LIMITATION = (
@@ -413,7 +413,7 @@ def _audit_files(root: Path, policy: RepositoryContext, recorded_hashes: set[str
             elif not stat.S_ISREG(initial.st_mode):
                 raise ContextError("Worktree instruction audit encountered a special file", [])
             elif key not in source and key not in recorded_hashes:
-                # Keep ignored paths visible to the scope and AGENTS.md checks.
+                # Retain ignored paths for before/after scope and integrity checks.
                 # ctime detects in-place changes even when size and mtime are restored.
                 value = {
                     "type": "file",
@@ -477,7 +477,11 @@ def audit_file_hash(directory: int, name: str, initial: os.stat_result) -> str:
 
 
 def check_documents(
-    bundle: InstructionBundle, files: RunRecord, scopes: list[RunRecord] | None = None
+    bundle: InstructionBundle,
+    files: RunRecord,
+    scopes: list[RunRecord] | None = None,
+    *,
+    worktree: Path,
 ) -> None:
     """Check mandatory worktree documents against baseline hashes and scoped discoveries."""
     for doc in bundle.documents:
@@ -488,6 +492,7 @@ def check_documents(
                     f"Required baseline context changed or missing: {doc['path']}", bundle
                 )
     known = {d["path"] for d in bundle.documents if d["kind"] == "instruction"}
+    unexpected = []
     for path in files:
         if PurePosixPath(path).name == "AGENTS.md" and path not in known:
             # Generated instructions may affect approved subtrees despite being absent at baseline.
@@ -497,9 +502,15 @@ def check_documents(
                 or in_scope(s["path"], [{"path": directory, "kind": "directory"}])
                 for s in scopes
             ):
-                raise InstructionError(
-                    f"Instruction scope is absent from the baseline manifest: {path}", bundle
-                )
+                unexpected.append(path)
+    # An ignored package document can be present in the filesystem audit without
+    # supplying instructions. Respect the index so force-added instructions still fail.
+    ignored = ignored_paths(worktree, unexpected, include_tracked=False)
+    for path in unexpected:
+        if path not in ignored:
+            raise InstructionError(
+                f"Instruction scope is absent from the baseline manifest: {path}", bundle
+            )
 
 
 def validate_changes(

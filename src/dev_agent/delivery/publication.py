@@ -1,7 +1,7 @@
-"""Authorise and recover draft GitHub publication and observe the published commit.
+"""Authorise and recover GitHub PR publication and observe the published commit.
 
 Preview validates evidence and GitHub destination without mutating Git or GitHub. An explicit
-confirmation gates staging, committing, pushing and draft creation. CI observations are retained
+confirmation gates staging, committing, pushing and PR creation. CI observations are retained
 separately from approval and verification.
 """
 
@@ -15,10 +15,11 @@ import time
 from copy import deepcopy
 from pathlib import Path, PurePosixPath
 
-from dev_agent.config import Config
+from dev_agent.config import Config, Project
 from dev_agent.delivery.adoption import audit_candidate, validate_adoption
 from dev_agent.delivery.review import validate_recorded_review
 from dev_agent.errors import DevAgentError
+from dev_agent.integrations.actions import required_ci_observation, workflow_problems
 from dev_agent.integrations.github import GitHub, GitHubError, ci_observation
 from dev_agent.records import RunRecord, Store, atomic_json, atomic_write, new_id, now
 from dev_agent.reporting.results import export_results
@@ -183,7 +184,7 @@ def text_option(value: str, label: str, maximum: int) -> str:
 
 
 def pull_body(record: RunRecord, plan: RunRecord) -> str:
-    """Render a draft PR body with verification status, caveats and a review reminder."""
+    """Render a PR body with distinct verification and review states."""
     profiles = plan["verification"]["profiles"]
     full = profiles["full"]["status"]
     warning = (
@@ -201,6 +202,16 @@ def pull_body(record: RunRecord, plan: RunRecord) -> str:
         if plan.get("legacy_adoption")
         else ""
     )
+    policy = plan.get("verification_policy", {})
+    remote = policy.get("mode") == "remote-ci"
+    if remote:
+        warning = "**FULL REGRESSION VERIFICATION IS PENDING REQUIRED GITHUB ACTIONS CHECKS.**\n\n"
+    full_line = (
+        f"- Local full profile: {full}. Required GitHub Actions jobs provide the regression gate.\n"
+        if remote
+        else f"- Full: {full}; this is separate from targeted verification and CI.\n"
+    )
+    pr_label = "A draft PR" if plan.get("pr_mode", "draft") == "draft" else "Ready for review"
     return (
         f"{adoption_note}"
         f"{warning}## Summary\n\n{plan['summary']}\n\n"
@@ -210,13 +221,45 @@ def pull_body(record: RunRecord, plan: RunRecord) -> str:
         "remains with reviewers.\n\n"
         "## Verification\n\n"
         f"- Targeted: {profiles['targeted']['status']} ({profiles['targeted']['attempt_id']}).\n"
-        f"- Full: {full}; this is separate from targeted verification and CI.\n"
+        f"{full_line}"
         f"- Original implementation outcome: {record['outcome']}.\n"
         f"- Approved source fingerprint: `{plan['verified_fingerprint']}`.\n\n"
         "## Review and limitations\n\n"
         "Review the diff, acceptance criteria, architecture and CI before approval. "
-        "A draft PR is not approval. No automatic merging or deployment is requested.\n\n"
+        f"{pr_label} is not approval. No automatic merging or deployment is requested.\n\n"
         f"dev-agent run: `{record['run_id']}`\n"
+    )
+
+
+def baseline_ci_blockers(project: Project, baseline: str, pr_mode: str) -> list[str]:
+    """Qualify the selected PR mode against required workflows in the exact baseline."""
+    blockers = []
+    for path, jobs in project.verification_policy.required_checks:
+        tree = git(project.repository, "ls-tree", baseline, "--", path).stdout
+        if not tree.startswith((b"100644 blob ", b"100755 blob ")):
+            blockers.append(f"{path}: required CI workflow is missing or is not a regular file")
+            continue
+        ref = f"{baseline}:{path}"
+        if int(output(project.repository, "cat-file", "-s", ref)) > 1024 * 1024:
+            blockers.append(f"{path}: required CI workflow exceeds the safe size limit")
+            continue
+        raw = git(project.repository, "cat-file", "blob", ref).stdout
+        blockers.extend(
+            f"{path}: {problem}"
+            for problem in workflow_problems(raw, project.base_branch, pr_mode, list(jobs))
+        )
+    return blockers
+
+
+def pull_matches(pull: RunRecord, plan: RunRecord, commit: str | None) -> bool:
+    """Match the approved mode, branches and pushed commit without changing an existing PR."""
+    return (
+        pull.get("draft") is (plan.get("pr_mode", "draft") == "draft")
+        and pull.get("state") == "open"
+        and pull.get("head", {}).get("sha") == commit
+        and pull.get("base", {}).get("ref") == plan["base_branch"]
+        and pull.get("head", {}).get("repo", {}).get("full_name", "").lower()
+        == plan["repository"].lower()
     )
 
 
@@ -244,7 +287,7 @@ def audit_implementation_scopes(
     previous = json.loads(before.read_text())
     root = Path(record["worktree"])
     audit = audit_files(root, config.project(record["project"]).context, previous=previous)
-    check_documents(bundle, audit, record["approved_scope"])
+    check_documents(bundle, audit, record["approved_scope"], worktree=root)
     validation = validate_changes(
         bundle,
         deepcopy(compliance),
@@ -268,8 +311,9 @@ def publication_plan(
     allow_incomplete_full: bool = False,
     incomplete_full_reason: str | None = None,
     acknowledge_stale_base: bool = False,
+    pr_mode: str = "draft",
 ) -> tuple[RunRecord, GitHub]:
-    """Validate a retained implementation and compute a draft-publication preview.
+    """Validate a retained implementation and compute a publication preview.
 
     Check destination, task branch identity, current instructions, source fingerprint,
     verification and any required delivery review. Resolve manifest, remote status and explicit
@@ -292,6 +336,22 @@ def publication_plan(
     ):
         raise DevAgentError("Codex must have completed successfully before publication")
     project = validate_managed_worktree(config, record)
+    policy = project.verification_policy
+    remote_ci = policy.mode == "remote-ci"
+    governing_record = record["adoption"]["candidate"] if kind == "adoption" else record
+    policy.validate_recorded(governing_record)
+    if pr_mode not in ("draft", "ready"):
+        raise DevAgentError("PR mode must be draft or ready")
+    if remote_ci and (allow_incomplete_full or incomplete_full_reason):
+        raise DevAgentError("Full-verification overrides do not apply to remote-ci")
+    waiver = (
+        kind == "implementation"
+        and pr_mode == "draft"
+        and "verification_policy" not in record
+        and not record.get("delivery_id")
+    )
+    if kind != "adoption" and not waiver and (allow_incomplete_full or incomplete_full_reason):
+        raise DevAgentError("This publication requires full verification without override")
     if not project.github:
         raise DevAgentError("Configure projects.NAME.github before publication")
     if project.base_branch != record["base_branch"]:
@@ -318,6 +378,10 @@ def publication_plan(
         audit, validation = audit_implementation_scopes(config, record, bundle)
     content = source_content(root, audit)
     prior = record.get("publication", {})
+    if prior and prior.get("approved_plan", {}).get("pr_mode", "draft") != pr_mode:
+        raise DevAgentError("PR mode differs from recorded approval; refusing PR conversion")
+    if record.get("delivery_id") and record.get("pr_mode", "draft") != pr_mode:
+        raise DevAgentError("PR mode differs from the delivery checkpoint")
     owned = prior.get("commit_sha")
     if current["head_commit"] != (owned or baseline):
         raise DevAgentError(
@@ -338,7 +402,7 @@ def publication_plan(
     legacy_approval = None
     if kind == "adoption":
         legacy_approval = validate_adoption(config, project, record, fingerprint, adoption_audit)
-    elif record.get("delivery_id"):
+    elif record.get("delivery_id") or remote_ci:
         validate_recorded_review(config, record, fingerprint)
     changed = changed_files(root, baseline)
     if not changed:
@@ -383,12 +447,16 @@ def publication_plan(
             "Passing current targeted verification is required; legacy checks do not imply "
             "targeted coverage"
         )
-    if evidence["profiles"]["full"]["status"] != "passed" and not (
-        allow_incomplete_full and incomplete_full_reason
+    if (
+        not remote_ci
+        and evidence["profiles"]["full"]["status"] != "passed"
+        and not (waiver and allow_incomplete_full and incomplete_full_reason)
     ):
         blockers.append(
             "Full verification is incomplete/failed; use --allow-incomplete-full with "
             "--full-verification-reason"
+            if waiver
+            else "Passing current local full verification is required by local-full"
         )
     if excluded:
         blockers.append(
@@ -413,15 +481,47 @@ def publication_plan(
             "(no rebase/merge)"
         )
     existing = client.existing_pull(record["branch"], project.base_branch)
-    if existing and (
-        not existing.get("draft")
-        or existing.get("state") != "open"
-        or existing.get("head", {}).get("sha") != owned
-        or existing.get("base", {}).get("ref") != record["base_branch"]
-        or existing.get("head", {}).get("repo", {}).get("full_name", "").lower()
-        != client.repository.lower()
-    ):
-        blockers.append("Existing PR is not an open draft at the recorded publication commit")
+    mode_plan = {
+        "pr_mode": pr_mode,
+        "base_branch": project.base_branch,
+        "repository": client.repository,
+    }
+    if existing and not pull_matches(existing, mode_plan, owned):
+        blockers.append(
+            f"Existing PR is not an open {pr_mode} PR at the recorded publication commit"
+        )
+    inventory = client.workflows(remote_base)
+    required_workflows = {}
+    if remote_ci:
+        if any(name.startswith((".github/workflows/", ".github/actions/")) for name in changed):
+            blockers.append(
+                "Remote CI cannot certify changes to workflow or local action definitions"
+            )
+        remote_hashes = {item["path"]: item["content_sha256"] for item in inventory}
+        for path, jobs in policy.required_checks:
+            if path not in remote_hashes:
+                blockers.append(f"{path}: required CI workflow is missing from the remote base")
+                continue
+            raw = client.workflow_source(path, remote_base)
+            checksum = hashlib.sha256(raw).hexdigest()
+            if checksum != remote_hashes[path]:
+                blockers.append(f"{path}: remote workflow content could not be confirmed")
+                continue
+            blockers.extend(
+                f"{path}: {problem}"
+                for problem in workflow_problems(raw, project.base_branch, pr_mode, list(jobs))
+            )
+            active = client.api(f"actions/workflows/{PurePosixPath(path).name}", missing=True)
+            if (
+                not isinstance(active, dict)
+                or active.get("path") != path
+                or active.get("state") != "active"
+                or type(active.get("id")) is not int
+                or active["id"] <= 0
+            ):
+                blockers.append(f"{path}: required workflow is not active on GitHub")
+                continue
+            required_workflows[path] = {"content_sha256": checksum, "id": active["id"]}
     plan = {
         "schema_version": 1,
         "run_id": record["run_id"],
@@ -465,15 +565,19 @@ def publication_plan(
             "PR summary",
             2000,
         ),
-        "draft": True,
+        "draft": pr_mode == "draft",
         "existing_pr": existing and {"number": existing["number"], "url": existing["html_url"]},
-        "workflows": client.workflows(remote_base),
+        "workflows": inventory,
         "blockers": blockers,
         "warning": (
             "Push/PR events may trigger existing workflows, including owner-configured "
             "deployment jobs. Review workflow policy before confirmation."
         ),
     }
+    if "verification_policy" in governing_record or remote_ci or pr_mode == "ready":
+        plan.update(pr_mode=pr_mode, verification_policy=policy.evidence())
+    if remote_ci:
+        plan["required_workflows"] = required_workflows
     if legacy_approval:
         plan["legacy_adoption"] = legacy_approval
     plan["body"] = pull_body(record, plan)
@@ -605,7 +709,7 @@ def publish_run(
 
     Unconfirmed calls and dry runs compute the plan without Git or remote writes. Confirmed
     calls hold the run lock, recheck the manifest and any supplied plan digest, then reuse or
-    create the commit and the draft PR in recorded steps. Keep evidence of partial publication
+    create the commit and the selected PR in recorded steps. Keep evidence of partial publication
     and observe CI for the published commit.
 
     Returns:
@@ -641,6 +745,7 @@ def publish_run(
             repository=client.repository,
             branch=record["branch"],
             base_branch=record["base_branch"],
+            pr_mode=plan.get("pr_mode", "draft"),
             status="approved",
         )
         phase = "commit"
@@ -694,6 +799,11 @@ def publish_run(
             ):
                 raise DevAgentError("Source or HEAD changed before push; publication stopped")
             validate_origin(root, client.repository)
+            if (
+                plan.get("required_workflows")
+                and client.branch(plan["base_branch"]) != plan["remote_base_commit"]
+            ):
+                raise DevAgentError("Remote base changed after approval; preview again")
             head = client.branch(record["branch"], missing=True)
             if head is not None and head != pub["commit_sha"]:
                 raise DevAgentError("Remote head changed; refusing to push")
@@ -703,6 +813,11 @@ def publish_run(
                 raise DevAgentError("Remote branch commit could not be confirmed")
             event("pushed")
             phase = "pull_request"
+            if (
+                plan.get("required_workflows")
+                and client.branch(plan["base_branch"]) != plan["remote_base_commit"]
+            ):
+                raise DevAgentError("Remote base changed after push; preview again")
             pull = client.existing_pull(record["branch"], record["base_branch"])
             if pull is None:
                 client.call(
@@ -710,7 +825,7 @@ def publish_run(
                     "create",
                     "--repo",
                     client.repository,
-                    "--draft",
+                    *(("--draft",) if plan["draft"] else ()),
                     "--base",
                     record["base_branch"],
                     "--head",
@@ -721,22 +836,17 @@ def publish_run(
                     str(directory / "pr-body.md"),
                 )
                 pull = client.existing_pull(record["branch"], record["base_branch"])
-            if (
-                not pull
-                or not pull.get("draft")
-                or pull.get("state") != "open"
-                or pull.get("head", {}).get("sha") != pub["commit_sha"]
-                or pull.get("base", {}).get("ref") != record["base_branch"]
-                or pull.get("head", {}).get("repo", {}).get("full_name", "").lower()
-                != client.repository.lower()
-            ):
+            if not pull or not pull_matches(pull, plan, pub["commit_sha"]):
                 raise DevAgentError(
-                    "Created/existing PR identity or draft status could not be confirmed"
+                    "Created/existing PR identity or approved mode could not be confirmed"
                 )
             pub.update(
-                pr_number=pull["number"], pr_url=pull["html_url"], draft=True, published_at=now()
+                pr_number=pull["number"],
+                pr_url=pull["html_url"],
+                draft=plan["draft"],
+                published_at=now(),
             )
-            event("draft_created")
+            event("draft_created" if plan["draft"] else "ready_pr_created")
             phase = "ci"
             monitor(config, record, client, watch=watch)
             event("published")
@@ -750,8 +860,8 @@ def publish_run(
                 if isinstance(exc, GitHubError)
                 else "Local publication step failed; inspect worktree and canonical evidence",
                 recovery=(
-                    "Resolve the reported problem, preview again, then repeat publish --draft "
-                    "--confirm with the same verification acknowledgements; "
+                    "Resolve the reported problem, preview again, then repeat publish "
+                    f"--pr-mode {pub['pr_mode']} --confirm with the same acknowledgements; "
                     "no reset, force push or duplicate PR is automatic"
                 ),
             )
@@ -781,8 +891,15 @@ def monitor(config: Config, record: RunRecord, client: GitHub, *, watch: bool) -
     settings = config.project(record["project"]).github
     deadline = time.monotonic() + settings.ci_timeout_seconds
     client.deadline = deadline
+    plan = pub.get("approved_plan", {})
+    governing_record = record.get("adoption", {}).get("candidate", record)
+    if "verification_policy" in governing_record and (
+        plan.get("verification_policy") != governing_record["verification_policy"]
+    ):
+        raise DevAgentError("Publication is missing its recorded verification policy")
+    remote = plan.get("verification_policy", {}).get("mode") == "remote-ci"
     try:
-        workflows = client.workflows(pub["commit_sha"])
+        workflows = [] if remote else client.workflows(pub["commit_sha"])
     except GitHubError:
         observation = {
             "observed_at": now(),
@@ -796,25 +913,30 @@ def monitor(config: Config, record: RunRecord, client: GitHub, *, watch: bool) -
         pub["ci_observations"].append(observation)
         persist(config, record)
         return observation
-    pub["workflows"] = workflows
+    if not remote:
+        pub["workflows"] = workflows
     while True:
-        observation = ci_observation(client, pub["commit_sha"], pub["pr_number"], workflows)
+        observation = (
+            required_ci_observation(client, pub)
+            if remote
+            else ci_observation(client, pub["commit_sha"], pub["pr_number"], workflows)
+        )
         pub["ci_observations"].append(observation)
         persist(config, record)
         deadline_expired = time.monotonic() >= deadline
         if (
             not watch
-            or observation["status"] not in ("pending", "no_checks", "unable_to_retrieve")
+            or observation["status"]
+            not in ("pending", "missing", "no_checks", "unable_to_retrieve")
             or (observation["status"] == "unable_to_retrieve" and not deadline_expired)
         ):
             return observation
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             observation = {
+                **observation,
                 "observed_at": now(),
-                "commit_sha": pub["commit_sha"],
                 "status": "monitoring_timeout",
-                "checks": [],
                 "note": (
                     "Remote workflows were not cancelled; "
                     "previous observations retain check details"

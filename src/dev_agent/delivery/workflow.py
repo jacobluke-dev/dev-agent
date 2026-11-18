@@ -12,7 +12,7 @@ from pathlib import Path
 
 from dev_agent.config import Config
 from dev_agent.delivery.implementation import can_resume_preparation, implement
-from dev_agent.delivery.publication import ci_run, publish_run
+from dev_agent.delivery.publication import baseline_ci_blockers, ci_run, publish_run
 from dev_agent.delivery.review import review
 from dev_agent.errors import DevAgentError
 from dev_agent.integrations.atlassian import content_hash, jira_key, requirement_units
@@ -164,7 +164,9 @@ def validate_intake(
     return snapshot, assessment
 
 
-def _validate_resume(config: Config, record: RunRecord, project_name: str, task: str) -> None:
+def _validate_resume(
+    config: Config, record: RunRecord, project_name: str, task: str, pr_mode: str
+) -> None:
     """Check the saved delivery's identity, configuration, baseline and planning artifact hashes."""
     if (
         record.get("kind") != "delivery"
@@ -175,6 +177,9 @@ def _validate_resume(config: Config, record: RunRecord, project_name: str, task:
     ):
         raise DevAgentError("Delivery identity/configuration changed; refusing unsafe resumption")
     project = config.project(project_name)
+    project.verification_policy.validate_recorded(record)
+    if record.get("pr_mode", "draft") != pr_mode:
+        raise DevAgentError("PR mode differs from the delivery checkpoint")
     baseline = validate_repository(project, config.runs_root)
     if (
         str(project.repository) != record["repository"]
@@ -208,47 +213,55 @@ def deliver(
     confirmed: bool = False,
     watch: bool = False,
     dry_run: bool = False,
+    pr_mode: str = "draft",
     resume: str | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> RunRecord:
     """Run or resume the delivery workflow and retain its checkpoint evidence.
 
     Dry-run validates local configuration and baseline context only. A live run records the
-    intake blocker or advances an eligible checkpoint through implementation, both verification
-    profiles, independent review, publication preview and CI observation. Confirm authorises
-    only the commit, push and draft PR step after mandatory gates.
+    intake blocker or advances an eligible checkpoint through implementation, policy-selected
+    checks, independent review, publication and CI. Confirmation covers the selected PR mode.
 
     Returns:
         A local dry-run plan or the canonical delivery record with its outcome and blockers.
     """
     jira_key(task)
     project = config.project(project_name)
+    policy = project.verification_policy
+    if pr_mode not in ("draft", "ready"):
+        raise DevAgentError("PR mode must be draft or ready")
     baseline = validate_repository(project, config.runs_root)
     bundle = resolve_project(project, baseline.commit)
-    for profile in ("targeted", "full"):
+    for profile in policy.local_profiles:
         if not project.checks(profile)[1]:
             raise DevAgentError(f"Delivery requires configured {profile} verification")
     if not project.github:
         raise DevAgentError("Delivery requires trusted GitHub publication configuration")
+    ci_blockers = baseline_ci_blockers(project, baseline.commit, pr_mode)
     if dry_run:
         if resume:
-            _validate_resume(config, Store(config.runs_root).load(resume), project_name, task)
+            _validate_resume(
+                config, Store(config.runs_root).load(resume), project_name, task, pr_mode
+            )
         return {
             "dry_run": True,
             "project": project_name,
             "task": task,
             "baseline_commit": baseline.commit,
             "instructions": bundle.provenance(),
+            "pr_mode": pr_mode,
+            "verification_policy": policy.evidence(),
             "status": "mcp_unavailable",
-            "blockers": [MCP_BLOCKER],
-            "confirm_scope": "Commit, push and draft PR only; never merge/deploy",
+            "blockers": [MCP_BLOCKER, *ci_blockers],
+            "confirm_scope": "Commit, push and selected PR only; never merge/deploy",
             "results_root": str(config.results_root),
             "canonical_root": str(config.runs_root),
         }
     store = Store(config.runs_root)
     if resume:
         record = store.load(resume)
-        _validate_resume(config, record, project_name, task)
+        _validate_resume(config, record, project_name, task, pr_mode)
     else:
         record = {
             "schema_version": 2,
@@ -261,6 +274,8 @@ def deliver(
             "baseline_commit": baseline.commit,
             "runs_root": str(config.runs_root),
             "configuration_sha256": config.source_digest,
+            "verification_policy": policy.evidence(),
+            "pr_mode": pr_mode,
             "created_at": now(),
             "phase": "planned",
             "outcome": "planned",
@@ -277,7 +292,7 @@ def deliver(
     with store.lock(record["run_id"]):
         # Reload under lock; another invocation must not overwrite a later checkpoint.
         record = store.load(record["run_id"])
-        _validate_resume(config, record, project_name, task)
+        _validate_resume(config, record, project_name, task, pr_mode)
 
         def save() -> None:
             """Write the canonical checkpoint, export its projection and retain the results path."""
@@ -294,8 +309,15 @@ def deliver(
                 progress(value)
 
         try:
+            if ci_blockers:
+                raise DeliveryBlocked("ci_configuration_blocked", "; ".join(ci_blockers))
             record.setdefault("authorisations", []).append(
-                {"at": now(), "publication_confirmed": confirmed, "watch": watch}
+                {
+                    "at": now(),
+                    "publication_confirmed": confirmed,
+                    "watch": watch,
+                    "pr_mode": pr_mode,
+                }
             )
             if not record.get("generated_plan"):
                 if (directory / "planning-repository").exists():
@@ -333,6 +355,8 @@ def deliver(
                         "brief": "implementation-brief.md",
                         "publication_requires_confirmation": True,
                         "independent_review_required": True,
+                        "verification_policy": policy.evidence(),
+                        "pr_mode": pr_mode,
                     },
                 }
                 for name, data in artifacts.items():
@@ -368,6 +392,7 @@ def deliver(
                     verification="targeted",
                     execution_id=child_id,
                     delivery_id=record["run_id"],
+                    pr_mode=pr_mode,
                     expected_baseline=baseline.commit,
                     progress=progress,
                     resume_preparation=child is not None,
@@ -376,19 +401,23 @@ def deliver(
                 child.get("delivery_id") != record["run_id"]
                 or child.get("task") != task
                 or child.get("baseline_commit") != baseline.commit
+                or child.get("pr_mode", "draft") != pr_mode
             ):
                 raise DeliveryBlocked(
                     "integrity_failed", "Implementation checkpoint identity differs"
                 )
             validate_managed_worktree(config, child)
+            policy.validate_recorded(child)
             if (
                 child.get("phase") != "finished"
                 or child.get("implementation_status") != "agent_completed"
             ):
                 if can_resume_preparation(child):
+                    detail = child.get("preparation", {}).get("error")
                     raise DeliveryBlocked(
                         "preparation_blocked",
-                        "Implementation preparation incomplete; inspect the child run and resume",
+                        detail
+                        or "Implementation setup incomplete; inspect the child run and resume",
                     )
                 raise DeliveryBlocked(
                     "implementation_blocked",
@@ -401,7 +430,7 @@ def deliver(
                 )
             if not child.get("publication", {}).get("commit_sha"):
                 prepared_here = latest_preparation(child) if starting_here else None
-                for profile in ("targeted", "full"):
+                for profile in policy.local_profiles:
                     attempts = [
                         a
                         for a in child.get("verification_attempts", [])
@@ -433,7 +462,8 @@ def deliver(
                         if preparation_blocked(latest):
                             raise DeliveryBlocked(
                                 "preparation_blocked",
-                                f"{profile} setup or prerequisites failed; inspect and resume",
+                                latest.get("error")
+                                or f"{profile} setup or prerequisites failed; inspect and resume",
                             )
                         raise DeliveryBlocked(
                             "verification_blocked",
@@ -482,6 +512,7 @@ def deliver(
                 stage("recovering_publication")
             stage("publication_preview")
             options = {
+                "pr_mode": pr_mode,
                 "title": snapshot["issue"]["title"],
                 "summary": json.loads((directory / "investigation.json").read_text())[
                     "executive_summary"
@@ -499,7 +530,7 @@ def deliver(
                     blockers=["Use --resume with --confirm after reviewing publication plan"],
                 )
                 return record
-            stage("publishing_draft")
+            stage("publishing_draft" if pr_mode == "draft" else "publishing_ready_pr")
             child = publish_run(
                 config,
                 child_id,

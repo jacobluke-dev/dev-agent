@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from dev_agent.config import identifier, load_config
+from dev_agent.config import identifier, load_config, parse_verification_policy
 from dev_agent.errors import DevAgentError
 
 
@@ -14,10 +14,29 @@ def test_config_loads_typed_defaults_and_commands(config_file: Path) -> None:
     project = config.project("example")
     assert project.base_branch == "main"
     assert project.verification[0].argv[-1] == "print('verified')"
+    assert project.verification_policy.mode == "local-full"
+    assert project.verification_policy.local_profiles == ("targeted", "full")
     assert project.agent.model == "fake-model"
     assert project.agent.reasoning_effort == "medium"
     with pytest.raises(DevAgentError, match="Unknown project"):
         config.project("unknown")
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {"mode": "unknown"},
+        {"mode": "remote-ci"},
+        {"mode": "remote-ci", "required_checks": {".github/workflows/ci.yml": []}},
+        {"mode": "remote-ci", "required_checks": {".github/workflows/ci.yml": ["A", "A"]}},
+        {"mode": "remote-ci", "required_checks": {"./../ci.yml": ["A"]}},
+        {"mode": "local-full", "required_checks": {".github/workflows/ci.yml": ["A"]}},
+    ],
+)
+def test_verification_policy_rejects_invalid_or_ambiguous_checks(policy: dict) -> None:
+    """Require explicit workflow-specific job expectations for remote full verification."""
+    with pytest.raises(DevAgentError, match="[Vv]erification|CI"):
+        parse_verification_policy(policy)
 
 
 @pytest.mark.parametrize("value", ["../escape", "a/b", "-arg", "", ".", "a b", "λ", "x" * 65])

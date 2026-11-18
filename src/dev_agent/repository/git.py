@@ -178,16 +178,24 @@ def source_paths(worktree: Path) -> set[bytes]:
     return set(paths.split(b"\0")) - {b""}
 
 
-def ignored_paths(worktree: Path, paths: Iterable[str]) -> set[str]:
-    """Test ignore rules even for indexed paths, without trusting force-added entries."""
+def ignored_paths(
+    worktree: Path, paths: Iterable[str], *, include_tracked: bool = True
+) -> set[str]:
+    """Check ignore rules for publication, or only untracked exclusions for instruction audits."""
     payload = b"".join(os.fsencode(path) + b"\0" for path in paths)
     if not payload:
         return set()
     result = git(
-        worktree, "check-ignore", "--no-index", "-z", "--stdin", input=payload, check=False
+        worktree,
+        "check-ignore",
+        *(["--no-index"] if include_tracked else []),
+        "-z",
+        "--stdin",
+        input=payload,
+        check=False,
     )
     if result.returncode not in (0, 1):
-        raise DevAgentError("Could not classify potentially ignored publication paths")
+        raise DevAgentError("Could not classify potentially ignored paths")
     return {os.fsdecode(path) for path in result.stdout.split(b"\0") if path}
 
 

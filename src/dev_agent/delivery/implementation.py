@@ -36,7 +36,7 @@ from dev_agent.repository.instructions import (
 )
 from dev_agent.repository.snapshot import ContextError
 from dev_agent.verification.commands import command_record, prepare, prerequisites
-from dev_agent.verification.runs import verification_attempt
+from dev_agent.verification.runs import latest_preparation, verification_attempt
 
 
 def plan(
@@ -49,6 +49,7 @@ def plan(
     *,
     execution_id: str | None = None,
     delivery_id: str | None = None,
+    pr_mode: str = "draft",
     expected_baseline: str | None = None,
     retained: bool = False,
 ) -> tuple[RunRecord, str]:
@@ -88,6 +89,7 @@ def plan(
     record = {
         "schema_version": 2,
         "delivery_id": delivery_id,
+        "pr_mode": pr_mode if delivery_id else None,
         "instruction_compliance": bundle.provenance(),
         "approved_scope": scopes,
         "run_id": run_id,
@@ -110,6 +112,7 @@ def plan(
         "outcome": "planned",
         "verification_profile": profile,
         "configuration_sha256": config.source_digest,
+        "verification_policy": project.verification_policy.evidence(),
         "environment_names": sorted(project.env),
         "inherit_env": list(project.inherit_env),
         "preparation": {
@@ -161,6 +164,7 @@ def implement(
     scope: tuple[str, ...] | None = None,
     execution_id: str | None = None,
     delivery_id: str | None = None,
+    pr_mode: str = "draft",
     expected_baseline: str | None = None,
     progress: Callable[[str], None] | None = None,
     resume_preparation: bool = False,
@@ -186,6 +190,7 @@ def implement(
         scope,
         execution_id=execution_id,
         delivery_id=delivery_id,
+        pr_mode=pr_mode,
         expected_baseline=expected_baseline,
         retained=resume_preparation,
     )
@@ -207,8 +212,12 @@ def implement(
     after = None
     with store.lock(record["run_id"]):
         preparation_directory = directory / "preparation"
+        previous_preparation = None
         if resume_preparation:
             saved = store.load(record["run_id"])
+            project.verification_policy.validate_recorded(saved)
+            if saved.get("pr_mode", "draft") != pr_mode:
+                raise DevAgentError("PR mode differs from the implementation checkpoint")
             if not can_resume_preparation(saved) or any(
                 saved.get(key) != record[key]
                 for key in (
@@ -227,6 +236,7 @@ def implement(
             if output(worktree, "rev-parse", "HEAD") != saved["baseline_commit"]:
                 raise DevAgentError("Worktree HEAD changed during preparation; inspect the run")
             record = saved
+            previous_preparation = latest_preparation(saved)
             record["agent"].update(preflight)
             history = record.setdefault("preparation_history", [])
             history.append(
@@ -263,7 +273,13 @@ def implement(
             record["phase"] = "preparing"
             save()
             if not prepare(
-                project, worktree, record["preparation"], preparation_directory, save, validate
+                project,
+                worktree,
+                record["preparation"],
+                preparation_directory,
+                save,
+                validate,
+                previous=previous_preparation,
             ):
                 record["outcome"] = "environment_failed"
                 return record
@@ -276,7 +292,7 @@ def implement(
             record["phase"] = "validating_instructions"
             before = audit_files(worktree, project.context)
             atomic_json(directory / "instruction-audit-before.json", before)
-            check_documents(bundle, before, record["approved_scope"])
+            check_documents(bundle, before, record["approved_scope"], worktree=worktree)
             if output(worktree, "rev-parse", "HEAD") != record["baseline_commit"]:
                 raise InstructionError("Worktree HEAD changed before agent execution", bundle)
             supplied(bundle, record["instruction_compliance"], prompt)
@@ -288,6 +304,9 @@ def implement(
                 result.record(), status="passed" if result.ok else "failed", finished_at=now()
             )
             record["implementation_status"] = "agent_completed" if result.ok else "agent_failed"
+            if result.failure_kind == "cleanup_incomplete":
+                record.update(outcome="orchestration_failed", error=result.error)
+                return record
             after = audit_files(worktree, project.context)
             atomic_json(directory / "instruction-audit-after.json", after)
             validation = validate_changes(
@@ -407,11 +426,10 @@ def implement(
 
 
 def can_resume_preparation(record: RunRecord) -> bool:
-    """Only retry a checkpoint with durable evidence that implementation never began."""
+    """Select pre-agent checkpoints for a recovery check under the implementation lock."""
     agent = record.get("agent", {})
     return (
         agent.get("status") == "pending"
-        and record.get("preparation", {}).get("status") != "running"
         and not agent.get("started_at")
         and record.get("implementation_status") == "not_run"
         and not record.get("verification_attempts")
@@ -422,7 +440,7 @@ def can_resume_preparation(record: RunRecord) -> bool:
                 in ("environment_failed", "interrupted", "orchestration_failed")
                 and (
                     record.get("preparation", {}).get("status")
-                    in ("failed", "error", "interrupted")
+                    in ("failed", "error", "interrupted", "running", "uncertain")
                     or record.get("prerequisites", {}).get("status") == "failed"
                 )
             )

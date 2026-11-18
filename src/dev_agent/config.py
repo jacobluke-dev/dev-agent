@@ -202,6 +202,34 @@ class GitHubConfig:
 
 
 @dataclass(frozen=True)
+class VerificationPolicy:
+    """Select the publication gates and identify the required GitHub Actions jobs."""
+
+    mode: str = "local-full"
+    required_checks: tuple[tuple[str, tuple[str, ...]], ...] = ()
+
+    @property
+    def local_profiles(self) -> tuple[str, ...]:
+        """Return the profiles required before an orchestrated draft publication."""
+        return ("targeted",) if self.mode == "remote-ci" else ("targeted", "full")
+
+    def evidence(self) -> dict[str, Any]:
+        """Return the canonical, JSON-compatible policy snapshot for a run."""
+        return {
+            "mode": self.mode,
+            "required_checks": {path: list(checks) for path, checks in self.required_checks},
+        }
+
+    def validate_recorded(self, record: dict[str, Any]) -> None:
+        """Require the recorded policy, interpreting pre-policy records as local-full."""
+        if record.get("verification_policy", VerificationPolicy().evidence()) != self.evidence():
+            raise DevAgentError(
+                "Verification policy differs from recorded evidence; "
+                "resume under the original policy or qualify a new candidate"
+            )
+
+
+@dataclass(frozen=True)
 class Project:
     """Collect the settings for one managed repository and its execution policies."""
 
@@ -221,6 +249,7 @@ class Project:
     investigation: InvestigationConfig = field(default_factory=InvestigationConfig)
     github: GitHubConfig | None = None
     preparation_cache: PreparationCache | None = None
+    verification_policy: VerificationPolicy = field(default_factory=VerificationPolicy)
 
     def checks(self, profile: str | None) -> tuple[str, tuple[Check, ...]]:
         """Resolve a check profile, preferring targeted by default when it is configured.
@@ -305,6 +334,7 @@ def load_config(filename: Path) -> Config:
                 "preparation",
                 "preparation_cache",
                 "verification_profiles",
+                "verification_policy",
                 "env",
                 "inherit_env",
                 "prerequisites",
@@ -372,7 +402,13 @@ def load_config(filename: Path) -> Config:
             parse_preparation_cache(raw["preparation_cache"])
             if "preparation_cache" in raw
             else None,
+            parse_verification_policy(raw.get("verification_policy", {})),
         )
+        project = projects[name]
+        if project.verification_policy.mode == "remote-ci" and (
+            not project.github or not project.verification_profiles.get("targeted")
+        ):
+            raise DevAgentError(f"{name}: remote-ci requires GitHub and targeted verification")
     # Every storage root must be outside every configured source and its Git metadata.
     for project in projects.values():
         if any(overlaps(results, p) for p in (project.repository, project.worktree_root, runs)):
@@ -403,6 +439,35 @@ def load_config(filename: Path) -> Config:
     ):
         raise DevAgentError("results_root must not be inside Git metadata")
     return Config(filename, runs, projects, results, hashlib.sha256(content).hexdigest())
+
+
+def parse_verification_policy(value: object) -> VerificationPolicy:
+    """Validate a policy and its workflow-specific, literal job names."""
+    label = "verification_policy"
+    raw = table(value, {"mode", "required_checks"}, label)
+    mode = raw.get("mode", "local-full")
+    if mode not in ("local-full", "remote-ci"):
+        raise DevAgentError(f"{label}.mode must be local-full or remote-ci")
+    if mode == "local-full":
+        if "required_checks" in raw:
+            raise DevAgentError(f"{label}.required_checks is only valid with remote-ci")
+        return VerificationPolicy()
+    checks = raw.get("required_checks")
+    if not isinstance(checks, dict) or not 1 <= len(checks) <= 10:
+        raise DevAgentError(f"{label}.required_checks must map 1–10 workflow paths to job names")
+    required = []
+    for workflow, jobs in sorted(checks.items()):
+        if not re.fullmatch(r"\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml", workflow):
+            raise DevAgentError(f"Invalid required CI workflow path: {workflow!r}")
+        if not isinstance(jobs, list) or not 1 <= len(jobs) <= 50:
+            raise DevAgentError(f"Required CI checks for {workflow} must list 1–50 job names")
+        names = tuple(string(job, "required CI job name") for job in jobs)
+        if len(set(names)) != len(names) or any(
+            len(job) > 200 or not job.isprintable() or "${{" in job for job in names
+        ):
+            raise DevAgentError(f"Required CI checks for {workflow} must be unique literal names")
+        required.append((workflow, tuple(sorted(names))))
+    return VerificationPolicy(mode, tuple(required))
 
 
 def parse_github(value: object) -> GitHubConfig:

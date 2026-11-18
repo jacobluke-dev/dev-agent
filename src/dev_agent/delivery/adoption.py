@@ -130,7 +130,7 @@ def audit_candidate(
         raise DevAgentError("Adoption requires configured GitHub publication scope")
     root = Path(record["worktree"])
     scopes = approved_scopes(bundle, project.context.implementation_scope)
-    check_documents(bundle, files, scopes)
+    check_documents(bundle, files, scopes, worktree=root)
     changed = changed_files(root, record["baseline_commit"])
     if not changed:
         raise DevAgentError("No implementation changes to adopt")
@@ -161,10 +161,14 @@ def approval_digest(config: Config, project: Project, record: RunRecord) -> str:
     """Require passing current checks and review, then bind the approval to their evidence."""
     adoption = record["adoption"]
     candidate = adoption["candidate"]
+    project.verification_policy.validate_recorded(candidate)
     fingerprint = candidate["fingerprint"]
     checks = candidate_checks(config, project, record)
-    if any(check["status"] != "passed" for check in checks.values()):
-        raise DevAgentError("Adoption requires passing current targeted and full verification")
+    required = project.verification_policy.local_profiles
+    if any(checks[profile]["status"] != "passed" for profile in required):
+        raise DevAgentError(
+            f"Adoption requires passing current {' and '.join(required)} verification"
+        )
     validate_recorded_review(config, record, fingerprint)
     review_state = record["independent_review"]
     snapshot_hash = digest(adoption["requirements"])
@@ -183,7 +187,7 @@ def approval_digest(config: Config, project: Project, record: RunRecord) -> str:
             "original": adoption["original_record_sha256"],
             "candidate": candidate,
             "requirements": snapshot_hash,
-            "checks": {name: check["attempt_id"] for name, check in checks.items()},
+            "checks": {name: checks[name]["attempt_id"] for name in required},
             "review": [review_state["attempt_id"], review_state["result_sha256"]],
         }
     )
@@ -252,7 +256,7 @@ def adopt(
             raise DevAgentError(
                 "Adoption requires the original configured base and publication policy"
             )
-        for profile in ("targeted", "full"):
+        for profile in project.verification_policy.local_profiles:
             if not project.checks(profile)[1]:
                 raise DevAgentError(f"Adoption requires configured {profile} verification")
         existing = store.directory(checkpoint).exists()
@@ -282,6 +286,7 @@ def adopt(
             "configuration_sha256": config.source_digest,
             "audit": audit,
         }
+        policy = project.verification_policy.evidence()
         if not existing:
             record = {
                 **{key: original[key] for key in IDENTITY_FIELDS},
@@ -312,9 +317,12 @@ def adopt(
             else adoption["requirements"]
         )
         previous = adoption.get("candidate", {})
-        unchanged = {
-            key: previous.get(key) for key in candidate
-        } == candidate and snapshot == adoption["requirements"]
+        unchanged = (
+            {key: previous.get(key) for key in candidate} == candidate
+            and previous.get("verification_policy", {"mode": "local-full", "required_checks": {}})
+            == policy
+            and snapshot == adoption["requirements"]
+        )
         if accept_legacy is not None:
             if not unchanged or adoption.get("status") not in (
                 "awaiting_legacy_approval",
@@ -332,7 +340,14 @@ def adopt(
             adoption["status"] = "approved"
         else:
             if not unchanged:
-                adoption.update(candidate={**candidate, "started_at": now()}, requirements=snapshot)
+                if previous:
+                    adoption.setdefault("superseded_candidates", []).append(
+                        {**previous, "requirements_sha256": digest(adoption["requirements"])}
+                    )
+                adoption.update(
+                    candidate={**candidate, "verification_policy": policy, "started_at": now()},
+                    requirements=snapshot,
+                )
                 adoption.pop("approval_sha256", None)
                 record["approved_scope"] = audit["scope"]
                 record["files_changed"] = audit["changes"]["files"]
@@ -341,7 +356,12 @@ def adopt(
                 return record
             adoption["status"] = "verifying"
             store.save(record)
-            qualify(config, project, record, prepare=prepare)
+            try:
+                qualify(config, project, record, prepare=prepare)
+            except KeyboardInterrupt:
+                # A review or verification in progress may already have saved interruption evidence.
+                record = store.load(checkpoint)
+                record["adoption"]["status"] = "interrupted"
         save_with_results(config, record, store, preserve_original=True)
         return record
 
@@ -354,7 +374,7 @@ def qualify(config: Config, project: Project, record: RunRecord, *, prepare: boo
     source = candidate["fingerprint"]
     root = Path(record["worktree"])
     prepared_here = None
-    for profile in ("targeted", "full"):
+    for profile in project.verification_policy.local_profiles:
         check = candidate_checks(config, project, record)[profile]
         if check["status"] != "passed":
             attempt = verification_attempt(
@@ -367,6 +387,9 @@ def qualify(config: Config, project: Project, record: RunRecord, *, prepare: boo
             )
             prepare = False
             prepared_here = attempt["preparation"]
+            if attempt["outcome"] == "interrupted":
+                adoption.update(status="interrupted", blocked_profile=profile)
+                return
             if attempt["status"] != "passed" or source_state(root)["fingerprint"] != source:
                 adoption.update(
                     status="preparation_blocked"
@@ -408,6 +431,35 @@ def qualify(config: Config, project: Project, record: RunRecord, *, prepare: boo
 def summary(record: RunRecord) -> RunRecord:
     """Show the distinct provenance, audit, checks, review and operator approval states."""
     adoption = record["adoption"]
+    latest = (record.get("verification_attempts") or [{}])[-1]
+    in_progress = None
+    if latest and latest.get("phase") != "finished":
+        commands = (
+            latest.get("preparation", {}).get("commands", [])
+            if latest.get("phase") == "preparing"
+            else latest.get("checks", [])
+        )
+        command = next((item for item in commands if item.get("status") == "running"), {})
+        in_progress = {
+            **{key: latest.get(key) for key in ("attempt_id", "profile", "phase")},
+            "command": {
+                key: command.get(key)
+                for key in (
+                    "name",
+                    "controller_pid",
+                    "started_at",
+                    "timeout_seconds",
+                    "stdout_log",
+                    "stderr_log",
+                )
+            }
+            if command
+            else None,
+        }
+        if command:
+            in_progress["command"]["installer_pid"] = (
+                command.get("process", {}).get("child", {}).get("pid")
+            )
     return {
         "kind": "adoption",
         "adoption_run_id": record["run_id"],
@@ -417,6 +469,8 @@ def summary(record: RunRecord) -> RunRecord:
         "candidate": adoption.get("candidate"),
         "requirements_provenance": adoption["requirements"]["provenance"],
         "blocked_profile": adoption.get("blocked_profile"),
+        "recorded_in_progress": in_progress,
+        "preparation_recovery": latest.get("preparation", {}).get("recovery"),
         "verification": [
             {key: attempt.get(key) for key in ("attempt_id", "profile", "status", "outcome")}
             | {"preparation": attempt.get("preparation", {}).get("status", "not_run")}

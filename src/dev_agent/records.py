@@ -115,7 +115,7 @@ class Store:
                 fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise DevAgentError(
-                    "Run is active or being cleaned up; try again after it stops"
+                    f"Run {run_id} is active or being cleaned up; inspect its state before retrying"
                 ) from None
             try:
                 yield

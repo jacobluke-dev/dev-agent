@@ -164,8 +164,9 @@ def test_publication_gates(publishing: Publishing, problem: str) -> None:
 
 
 def test_incomplete_full_override_is_separate_and_prominent(publishing: Publishing) -> None:
-    """Disclose the explicit standalone waiver without rewriting original check results."""
+    """Retain the explicitly disclosed waiver for a pre-policy standalone draft run."""
     config, record, root, state = publishing
+    record.pop("verification_policy")
     record["outcome"] = "verification_failed"
     record["verification_attempts"][-1].update(status="failed", outcome="verification_failed")
     Store(config.runs_root).save(record)
@@ -180,6 +181,19 @@ def test_incomplete_full_override_is_separate_and_prominent(publishing: Publishi
     assert "FULL REGRESSION VERIFICATION IS INCOMPLETE OR FAILED" in body
     assert "Targeted: passed" in body and "Full: failed" in body
     assert result["outcome"] == "verification_failed"
+
+
+def test_current_local_full_policy_requires_full_even_with_confirmation(
+    publishing: Publishing,
+) -> None:
+    """Keep failed local full verification a publication blocker for a governed execution."""
+    config, record, _, state = publishing
+    record["verification_attempts"][-1].update(status="failed", outcome="verification_failed")
+    Store(config.runs_root).save(record)
+    for mode in ("draft", "ready"):
+        with pytest.raises(DevAgentError, match="local full verification"):
+            publish_run(config, record["run_id"], pr_mode=mode, confirmed=True)
+    assert not json.loads(state.read_text()).get("pushes")
 
 
 def test_dirty_source_and_ignored_files_preserved(publishing: Publishing) -> None:

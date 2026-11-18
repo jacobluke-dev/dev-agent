@@ -136,16 +136,39 @@ def test_ignored_stat_snapshot_detects_out_of_scope_edits(repo: Path) -> None:
     ]
 
 
-def test_git_ignored_instruction_is_still_detected(repo: Path) -> None:
-    """Refuse a generated instruction file even when Git ignores the entire directory."""
-    path = repo / "ignored" / "AGENTS.md"
-    path.parent.mkdir()
-    path.write_bytes(b"x" * 2048)
+def test_prepared_dependency_instructions_never_gain_authority(repo: Path) -> None:
+    """Ignore an installed package's guidance while enforcing tracked guidance beside it."""
+    (repo / ".gitignore").write_text("node_modules/\n")
+    tracked = repo / "node_modules/owned/AGENTS.md"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_text("Maintain the owned package.")
+    git(repo, "add", ".gitignore")
+    git(repo, "add", "-f", "node_modules/owned/AGENTS.md")
+    git(repo, "commit", "-m", "Track required package guidance")
     policy = RepositoryContext(max_audit_bytes=1024)
     bundle = resolve(repo, output(repo, "rev-parse", "HEAD"), policy)
-    audit = audit_files(repo, policy)
+    fingerprint = source_state(repo)["fingerprint"]
+    dependency = repo / "node_modules/next/AGENTS.md"
+    dependency.parent.mkdir()
+    dependency.write_text("External package instructions")
+    scopes = approved_scopes(bundle, (".",))
+    files = audit_files(repo, policy)
+    check_documents(bundle, files, scopes, worktree=repo)
+    assert "metadata_only" in files["node_modules/next/AGENTS.md"]
+    assert dependency.read_text() not in bundle.render()
+    assert bundle.applicable("node_modules/next/index.js") == ["AGENTS.md"]
+    assert bundle.applicable("node_modules/owned/index.js") == [
+        "AGENTS.md",
+        "node_modules/owned/AGENTS.md",
+    ]
+    assert source_state(repo)["fingerprint"] == fingerprint
+
+    git(repo, "add", "-f", "node_modules/next/AGENTS.md")
     with pytest.raises(InstructionError, match="absent from the baseline manifest"):
-        check_documents(bundle, audit, approved_scopes(bundle, (".",)))
+        check_documents(bundle, audit_files(repo, policy), scopes, worktree=repo)
+    tracked.write_text("Modified tracked instructions")
+    with pytest.raises(InstructionError, match="Required baseline context changed"):
+        check_documents(bundle, audit_files(repo, policy), scopes, worktree=repo)
 
 
 def test_special_ignored_files_remain_unsafe(repo: Path) -> None:

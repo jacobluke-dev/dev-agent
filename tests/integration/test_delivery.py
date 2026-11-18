@@ -20,7 +20,7 @@ from dev_agent.reporting.delivery import summary
 from dev_agent.repository.git import git, output, status
 from dev_agent.run_admin import inspect_run
 from tests.support.investigation import FakeReviewer, accepted_output
-from tests.support.publication import Publishing
+from tests.support.publication import Publishing, enable_remote_ci, state_change
 from tests.support.publication import publishing as publishing
 
 type DeliveryFixture = tuple[Publishing, FakeReviewer, list[str]]
@@ -168,6 +168,46 @@ def test_confirmed_delivery_and_read_only_ci_resumption(delivery_pipeline: Deliv
     assert len([c for c in data["calls"] if c[:2] == ["pr", "create"]]) == 1
     assert status(root)  # Existing independent worktree remains dirty and uncommitted.
     assert output(root, "rev-parse", "HEAD") == old["baseline_commit"]
+
+
+def test_ready_remote_ci_requires_review_and_exact_expected_checks(
+    delivery_pipeline: DeliveryFixture,
+) -> None:
+    """Deliver after targeted verification and independent review, then wait for required CI."""
+    (local, _, _, state), reviewer, intakes = delivery_pipeline
+    config = enable_remote_ci(local, state)
+    preview = deliver(config, "example", "TASK-42", dry_run=True, pr_mode="draft")
+    assert any("draft PR" in blocker for blocker in preview["blockers"])
+    result = deliver(config, "example", "TASK-42", pr_mode="ready")
+    assert result["outcome"] == "awaiting_confirmation", result["blockers"]
+    child = Store(config.runs_root).load(result["implementation_run_id"])
+    assert child["independent_review"]["status"] == "passed"
+    assert [attempt["profile"] for attempt in child["verification_attempts"]] == ["targeted"]
+    assert not json.loads(state.read_text()).get("pushes")
+    with pytest.raises(DevAgentError, match="PR mode differs"):
+        deliver(config, "example", "TASK-42", pr_mode="draft", resume=result["run_id"])
+    state_change(state, checks="absent")
+    result = deliver(
+        config,
+        "example",
+        "TASK-42",
+        pr_mode="ready",
+        resume=result["run_id"],
+        confirmed=True,
+        watch=True,
+    )
+    assert result["outcome"] == "ci_not_passed", result["blockers"]
+    assert summary(config, result)["ci_status"] == "monitoring_timeout"
+    state_change(state, checks="passed")
+    resumed = deliver(config, "example", "TASK-42", pr_mode="ready", resume=result["run_id"])
+    assert resumed["outcome"] == "delivered", resumed["blockers"]
+    details = summary(config, resumed)
+    assert details["pr_url"].endswith("/pull/7") and details["draft_pr_url"] is None
+    assert len(intakes) == reviewer.calls == 1
+    calls = json.loads(state.read_text())["calls"]
+    creates = [call for call in calls if call[:2] == ["pr", "create"]]
+    assert len(creates) == 1 and "--draft" not in creates[0]
+    assert not any(call[:2] == ["pr", "merge"] for call in calls)
 
 
 def test_publication_failure_recovery_reuses_commit_and_pr(
@@ -364,8 +404,9 @@ def test_invalid_ticket_evidence_stops_before_implementation(
     assert result["implementation_run_id"] is None
 
 
+@pytest.mark.parametrize("abandoned", [False, True])
 def test_delivery_retries_preparation_before_agent_on_same_checkpoint(
-    delivery_pipeline: DeliveryFixture, tmp_path: Path
+    delivery_pipeline: DeliveryFixture, tmp_path: Path, abandoned: bool
 ) -> None:
     """Resume a blocked setup while keeping the child run, worktree and first attempt evidence."""
     from tests.support.runs import configured, python_check
@@ -386,6 +427,13 @@ def test_delivery_retries_preparation_before_agent_on_same_checkpoint(
     child_id = first["implementation_run_id"]
     blocked = store.load(child_id)
     assert blocked["preparation"]["status"] == "failed" and blocked["agent"]["status"] == "pending"
+    if abandoned:
+        blocked.update(phase="preparing", outcome="planned", finished_at=None)
+        blocked["preparation"]["status"] = "running"
+        blocked["preparation"]["commands"][0].update(
+            status="running", exit_code=None, finished_at=None
+        )
+        store.save(blocked)
     root = Path(blocked["worktree"])
     gate.touch()
     resumed = deliver(config, "example", "TASK-42", resume=first["run_id"])
@@ -393,6 +441,7 @@ def test_delivery_retries_preparation_before_agent_on_same_checkpoint(
     assert resumed["implementation_run_id"] == child_id
     child = store.load(child_id)
     assert child["preparation_history"][0]["state"] == blocked["preparation"]
+    assert child["preparation"]["recovery"]["decision"] == "retry"
     assert child["verification_attempts"][-1]["preparation"]["reuse"] == "current_invocation"
     assert (root / "ignored/setup-count").read_text() == "1"
     projection = json.loads((Path(child["results_directory"]) / "report.json").read_text())

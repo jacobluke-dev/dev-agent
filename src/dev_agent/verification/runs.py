@@ -14,7 +14,13 @@ from dev_agent.records import RunRecord, Store, adoption_id, log, new_id, now
 from dev_agent.reporting.common import reserve_results
 from dev_agent.reporting.results import save_with_results
 from dev_agent.repository.git import changed_files, source_state, validate_managed_worktree
-from dev_agent.verification.commands import command_record, prepare, prerequisites, run_command
+from dev_agent.verification.commands import (
+    command_record,
+    preparation_recovery,
+    prepare,
+    prerequisites,
+    run_command,
+)
 
 
 def verification_attempt(
@@ -61,6 +67,7 @@ def verification_attempt(
         "started_at": now(),
         "finished_at": None,
         "configuration_sha256": config.source_digest,
+        "verification_policy": project.verification_policy.evidence(),
         "environment_names": sorted(project.env),
         "inherit_env": list(project.inherit_env),
         "checks": record["verification"] if initial else [command_record(c) for c in checks],
@@ -106,6 +113,15 @@ def verification_attempt(
                 if error := attempt["preparation"].get("error"):
                     attempt["error"] = error
                 return attempt
+        elif previous and (recovery := preparation_recovery(previous, force=False)):
+            attempt["preparation"]["recovery"] = recovery
+            if recovery["decision"] == "blocked":
+                reason = recovery["reason"]
+                attempt["preparation"].update(status="uncertain", error=reason)
+                attempt.update(
+                    status="environment_failed", outcome="environment_failed", error=reason
+                )
+                return attempt
         source = source_state(worktree)
         if (
             automatic_preparation
@@ -139,6 +155,13 @@ def verification_attempt(
         for check, result in zip(checks, attempt["checks"], strict=True):
             validate()
             run_command(project, worktree, check, result, directory, save)
+            if result.get("failure_kind") == "cleanup_incomplete":
+                attempt.update(
+                    status="cleanup_incomplete",
+                    outcome="orchestration_failed",
+                    error=result["error"],
+                )
+                return attempt
         status_value = (
             "skipped"
             if not checks
@@ -241,12 +264,20 @@ def verify(
 
 
 def latest_preparation(record: RunRecord) -> RunRecord | None:
-    """Find the latest actual setup state without overlooking a failure or interruption."""
-    for attempt in reversed(record.get("verification_attempts", [])):
-        state = attempt.get("preparation", {})
+    """Find the latest substantive setup attempt, bypassing empty recovery refusals."""
+    states = [prior["state"] for prior in record.get("preparation_history", [])]
+    states.append(record.get("preparation") or {})
+    states += [
+        attempt.get("preparation", {}) for attempt in record.get("verification_attempts", [])
+    ]
+    refusal = None
+    for state in reversed(states):
+        if state.get("status") == "uncertain" and not state.get("commands"):
+            refusal = refusal or state
+            continue
         if state.get("status") not in (None, "not_run", "skipped"):
             return state
-    return record.get("preparation")
+    return refusal or record.get("preparation")
 
 
 def preparation_blocked(attempt: RunRecord) -> bool:
@@ -267,6 +298,7 @@ def verification_evidence(
     eligible.
     """
     evidence = {"original_outcome": record["outcome"], "profiles": {}}
+    policy = project.verification_policy.evidence()
     for profile in ("targeted", "full"):
         attempts = [
             a for a in record.get("verification_attempts", []) if a.get("profile") == profile
@@ -290,6 +322,8 @@ def verification_evidence(
                 expected
                 and expected == actual
                 and latest.get("configuration_sha256") == config.source_digest
+                and latest.get("verification_policy", {"mode": "local-full", "required_checks": {}})
+                == policy
                 and latest.get("source_changed_during_verification") is False
                 and latest.get("prerequisites", {}).get("status") == "passed"
                 and latest.get("phase") == "finished"

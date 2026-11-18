@@ -199,7 +199,7 @@ def review(
             before_audit = audit_files(root, project.context)
             state["source_fingerprint"] = before["fingerprint"]
             bundle = resolve_project(project, record["baseline_commit"])
-            check_documents(bundle, before_audit, record["approved_scope"])
+            check_documents(bundle, before_audit, record["approved_scope"], worktree=root)
             compliance = bundle.provenance()
             state["instruction_compliance"] = compliance
             files = sorted(

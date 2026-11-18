@@ -17,6 +17,7 @@ from pathlib import Path
 from dev_agent.config import Check, Project, relative_path
 from dev_agent.errors import DevAgentError
 from dev_agent.process import ProcessInterrupted, environment, execute
+from dev_agent.process_identity import process_scope, process_state, recover_session
 from dev_agent.records import RunRecord, now
 
 MAX_PREPARATION_INPUT_BYTES = 32 * 1024 * 1024
@@ -129,7 +130,7 @@ def run_command(
     failure kinds. A process interruption records the interrupted result and propagates.
     """
     started = time.monotonic()
-    record.update(status="running", started_at=now())
+    record.update(status="running", started_at=now(), controller_pid=os.getpid())
     save()
     try:
         cwd = contained_path(worktree, command.cwd)
@@ -146,6 +147,30 @@ def run_command(
         out = directory / f"check-{command.name}.stdout.log"
         err = directory / f"check-{command.name}.stderr.log"
         record.update(stdout_log=str(out), stderr_log=str(err))
+        if not project_requirements:
+            try:
+                controller = process_state(os.getpid())
+                if controller:
+                    record["process"] = {
+                        "scope": process_scope(),
+                        "controller": controller.identity(),
+                    }
+            except OSError, ValueError, IndexError:
+                pass  # Keep running normally, with conservative recovery if interrupted.
+        save()
+
+        def child_started(pid: int) -> None:
+            """Checkpoint the installer session before waiting on the subprocess."""
+            evidence = record.get("process")
+            if evidence is not None:
+                try:
+                    child = process_state(pid)
+                except OSError, ValueError, IndexError:
+                    return
+                if child and child.session == child.pid == child.group:
+                    evidence["child"] = {**child.identity(), "session": child.session}
+                    save()
+
         result = execute(
             list(command.argv),
             cwd=cwd,
@@ -153,11 +178,14 @@ def run_command(
             stderr=err,
             timeout=command.timeout_seconds,
             env=command_environment(project, worktree, command),
+            on_started=child_started if not project_requirements else None,
         )
         record.update(result.record(), status="passed" if result.ok else "failed")
         if not result.ok:
             record["failure_kind"] = (
-                "timeout"
+                "cleanup_incomplete"
+                if result.failure_kind == "cleanup_incomplete"
+                else "timeout"
                 if result.timed_out
                 else "missing_prerequisite"
                 if result.failure_kind == "missing_launch_prerequisite"
@@ -166,7 +194,9 @@ def run_command(
     except KeyboardInterrupt as exc:
         if isinstance(exc, ProcessInterrupted):
             record.update(exc.result.record())
-        record.update(status="interrupted", failure_kind="interrupted")
+        record["status"] = "interrupted"
+        if record.get("failure_kind") != "cleanup_incomplete":
+            record["failure_kind"] = "interrupted"
         raise
     except DevAgentError as exc:
         record.update(status="failed", failure_kind="missing_prerequisite", error=str(exc))
@@ -266,6 +296,50 @@ def preparation_outputs(project: Project, worktree: Path) -> str | None:
         return None
 
 
+def preparation_recovery(prior: RunRecord, *, force: bool) -> RunRecord | None:
+    """Reconcile previous setup under the caller's worktree lock without changing history."""
+    status = prior.get("status")
+    if status not in ("running", "uncertain", "interrupted", "failed", "error"):
+        return None
+    commands = prior.get("commands", [])
+    legacy = not commands and status in ("running", "uncertain")
+    checked = []
+    for command in commands:
+        command_status = command.get("status")
+        if command_status == "not_run":
+            continue
+        if command_status not in ("running", "passed", "failed", "interrupted", "error"):
+            return {"decision": "blocked", "reason": "Previous setup has invalid command evidence"}
+        unresolved = (
+            command.get("status") == "running"
+            or command.get("failure_kind") == "cleanup_incomplete"
+            or (
+                command.get("status") in ("error", "interrupted")
+                and command.get("exit_code") is None
+            )
+        )
+        if evidence := command.get("process"):
+            if evidence.get("child") or unresolved:
+                result = recover_session(evidence)
+                if result["decision"] == "blocked":
+                    return result
+                checked.append(result["reason"])
+        elif unresolved:
+            legacy = True
+    if legacy:
+        reason = (
+            "Previous setup has no durable installer identity. Inspect surviving processes "
+            "before proceeding. For a legacy adoption, --prepare records an operator retry."
+        )
+        return {"decision": "operator_retry" if force else "blocked", "reason": reason}
+    if checked or status in ("running", "uncertain"):
+        return {
+            "decision": "retry",
+            "reason": "; ".join(checked) or "No unfinished command was launched in the checkpoint",
+        }
+    return None
+
+
 def prepare(
     project: Project,
     worktree: Path,
@@ -285,20 +359,19 @@ def prepare(
     durable success only with matching inputs and outputs, or reuse setup just seen
     in this invocation when the project has no persistent cache configured.
     """
+    validate()
+    prior = previous or {}
+    recovery = preparation_recovery(prior, force=force)
+    if recovery:
+        state["recovery"] = recovery
+        if recovery["decision"] == "blocked":
+            state.update(status="uncertain", commands=[], error=recovery["reason"])
+            save()
+            return False
     if not project.preparation:
         state.update(status="skipped", commands=[])
         save()
         return True
-    validate()
-    prior = previous or {}
-    if not force and prior.get("status") in ("running", "uncertain"):
-        state.update(
-            status="uncertain",
-            commands=[],
-            error="Previous setup may still be running; inspect it before forcing preparation",
-        )
-        save()
-        return False
     key = preparation_fingerprint(project, worktree)
     outputs = preparation_outputs(project, worktree) if key and not force else None
     try:
@@ -326,10 +399,12 @@ def prepare(
             reuse="validated_cache",
         )
         save()
+
         return True
     if (
         prerequisites_available
         and not project.preparation_cache
+        and recovery is None
         and (prepared_here or {}).get("status") in ("passed", "reused")
     ):
         state.update(status="reused", commands=[], reuse="current_invocation")
@@ -344,6 +419,9 @@ def prepare(
             run_command(
                 project, worktree, command, record, directory, save, project_requirements=False
             )
+            if record.get("failure_kind") == "cleanup_incomplete":
+                state.update(status="uncertain", error=record["error"])
+                return False
             if record["status"] != "passed" and command.required:
                 state["status"] = "failed"
                 return False
@@ -361,7 +439,11 @@ def prepare(
                 state.update(fingerprint=key, outputs_sha256=outputs)
         return True
     except KeyboardInterrupt:
-        state["status"] = "interrupted"
+        state["status"] = (
+            "uncertain"
+            if any(c.get("failure_kind") == "cleanup_incomplete" for c in state["commands"])
+            else "interrupted"
+        )
         raise
     except Exception:
         state["status"] = "error"

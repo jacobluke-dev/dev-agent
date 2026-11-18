@@ -9,8 +9,14 @@ import os
 import signal
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+STOP_GRACE_SECONDS = 2
+CLEANUP_ERROR = (
+    "Subprocess cleanup could not be confirmed; inspect the process group before retrying"
+)
 
 
 def environment() -> dict[str, str]:
@@ -49,22 +55,23 @@ class ProcessInterrupted(KeyboardInterrupt):
         self.result = result
 
 
-def stop(process: subprocess.Popen[bytes]) -> None:
-    """Signal the subprocess group, escalate after a short wait and reap the child."""
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    try:
-        process.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        pass
-    # Kill surviving descendants even if their parent has already exited.
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    process.wait()
+def stop(process: subprocess.Popen[bytes]) -> bool:
+    """Signal the group and bound the wait for the direct child, even if the group is gone."""
+    signalled = True
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        # Check for surviving descendants even if the first wait reaped their leader.
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            signalled = False
+        try:
+            process.wait(timeout=STOP_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            if sig == signal.SIGKILL:
+                return False
+    return signalled
 
 
 def execute(
@@ -76,12 +83,14 @@ def execute(
     timeout: int,
     stdin: str | None = None,
     env: dict[str, str] | None = None,
+    on_started: Callable[[int], None] | None = None,
 ) -> ProcessResult:
     """Run an argument vector in a dedicated process group and capture its output.
 
     The caller supplies an existing working directory and two new log paths. Logs are created
     exclusively with owner-only permissions. Optional stdin is encoded as UTF-8. An explicit
-    environment replaces the default allowlist.
+    environment replaces the default allowlist. The optional callback checkpoints the
+    child identity before any wait and participates in subprocess cleanup on failure.
 
     Returns:
         Exit and duration evidence, including launch failures and timeouts.
@@ -115,16 +124,35 @@ def execute(
                 else "launch_error",
             )
         try:
-            process.communicate(input=stdin.encode("utf-8") if stdin else None, timeout=timeout)
+            if on_started:
+                on_started(process.pid)
+            if stdin:
+                process.communicate(input=stdin.encode("utf-8"), timeout=timeout)
+            else:
+                process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            stop(process)
-            return ProcessResult(process.returncode, time.monotonic() - started, timed_out=True)
+            reaped = stop(process)
+            return ProcessResult(
+                process.returncode,
+                time.monotonic() - started,
+                timed_out=True,
+                error=None if reaped else CLEANUP_ERROR,
+                failure_kind=None if reaped else "cleanup_incomplete",
+            )
         except KeyboardInterrupt as exc:
-            stop(process)
+            reaped = stop(process)
             raise ProcessInterrupted(
-                ProcessResult(process.returncode, time.monotonic() - started, error="Interrupted")
+                ProcessResult(
+                    process.returncode,
+                    time.monotonic() - started,
+                    error="Interrupted" if reaped else CLEANUP_ERROR,
+                    failure_kind=None if reaped else "cleanup_incomplete",
+                )
             ) from exc
         except BaseException:
             stop(process)
             raise
+        finally:
+            if process.stdin is not None and not process.stdin.closed:
+                process.stdin.close()
     return ProcessResult(process.returncode, time.monotonic() - started)
