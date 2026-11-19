@@ -6,6 +6,7 @@ acceptance of missing historical context is separate from the regular publicatio
 
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 
@@ -13,10 +14,12 @@ from dev_agent.config import Config, Project, identifier
 from dev_agent.delivery.review import read_candidate, review, validate_recorded_review
 from dev_agent.errors import DevAgentError
 from dev_agent.integrations.atlassian import content_hash, requirement_units
+from dev_agent.integrations.github import GitHub
 from dev_agent.records import RunRecord, Store, adoption_id, now
 from dev_agent.reporting.results import save_with_results
 from dev_agent.repository.git import (
     changed_files,
+    git,
     source_state,
     validate_managed_worktree,
     validate_repository,
@@ -122,8 +125,52 @@ def requirements(store: Store, original: RunRecord, requirements_run: str | None
     }
 
 
+def branch_history(
+    root: Path, bundle: InstructionBundle, parent: str, approved_head: str | None
+) -> RunRecord:
+    """Qualify an explicitly selected descendant and separate its history from pending changes."""
+    if approved_head is not None and approved_head != parent:
+        raise DevAgentError("Approved branch HEAD differs from the retained parent")
+    if parent == bundle.commit:
+        return {"commits": [], "paths": []}
+    if approved_head != parent:
+        raise DevAgentError(
+            f"Unexpected worktree HEAD; inspect history from {bundle.commit} to {parent} "
+            "and supply --approve-head with the full reviewed SHA"
+        )
+    if git(root, "merge-base", "--is-ancestor", bundle.commit, parent, check=False).returncode:
+        raise DevAgentError("Approved branch HEAD does not descend from the original baseline")
+    paths = {
+        os.fsdecode(p)
+        for p in git(
+            root, "diff", "--no-renames", "--name-only", "-z", bundle.commit, parent, "--"
+        ).stdout.split(b"\0")
+        if p
+    }
+    if paths.intersection(doc["path"] for doc in bundle.documents) or any(
+        Path(name).name == "AGENTS.md" for name in paths
+    ):
+        raise DevAgentError("Advanced branch HEAD changes baseline instruction or context files")
+    overlap = paths.intersection(changed_files(root, parent))
+    if overlap:
+        raise DevAgentError(
+            f"Pending implementation overlaps inherited branch changes: {sorted(overlap)}"
+        )
+    return {
+        "commits": git(root, "rev-list", "--reverse", f"{bundle.commit}..{parent}")
+        .stdout.decode()
+        .splitlines(),
+        "paths": sorted(paths),
+    }
+
+
 def audit_candidate(
-    project: Project, record: RunRecord, bundle: InstructionBundle, files: RunRecord
+    project: Project,
+    record: RunRecord,
+    bundle: InstructionBundle,
+    files: RunRecord,
+    *,
+    parent: str | None = None,
 ) -> RunRecord:
     """Resolve current baseline scopes and check every publishable candidate change."""
     if not project.github:
@@ -131,7 +178,12 @@ def audit_candidate(
     root = Path(record["worktree"])
     scopes = approved_scopes(bundle, project.context.implementation_scope)
     check_documents(bundle, files, scopes, worktree=root)
-    changed = changed_files(root, record["baseline_commit"])
+    changed = changed_files(
+        root,
+        parent
+        or record.get("adoption", {}).get("candidate", {}).get("previous_head")
+        or record["baseline_commit"],
+    )
     if not changed:
         raise DevAgentError("No implementation changes to adopt")
     validation = validate_changed_paths(bundle, changed, files, scopes, root)
@@ -234,6 +286,7 @@ def adopt(
     requirements_run: str | None = None,
     prepare: bool = False,
     accept_legacy: str | None = None,
+    approve_head: str | None = None,
 ) -> RunRecord:
     """Review an existing legacy worktree or accept one previously qualified candidate.
 
@@ -273,12 +326,20 @@ def adopt(
         root = Path(original["worktree"])
         validate_unstaged_worktree(root)
         before = source_state(root)
-        if before["head_commit"] != original["baseline_commit"]:
-            raise DevAgentError(
-                "Adoption requires the retained branch at its original baseline HEAD"
-            )
+        parent = before["head_commit"]
+        pinned = record["adoption"].get("candidate", {}).get("previous_head") if existing else None
         bundle = resolve_project(project, original["baseline_commit"])
-        audit = audit_candidate(project, original, bundle, audit_files(root, project.context))
+        history = branch_history(root, bundle, parent, approve_head or pinned)
+        if history["commits"]:
+            client = GitHub(root, project.github.repository)
+            client.preflight()
+            if client.branch(original["branch"], missing=True) != parent:
+                raise DevAgentError(
+                    "Advanced branch HEAD must already be published on the managed branch"
+                )
+        audit = audit_candidate(
+            project, original, bundle, audit_files(root, project.context), parent=parent
+        )
         if source_state(root)["fingerprint"] != before["fingerprint"]:
             raise DevAgentError("Source changed during adoption audit")
         candidate = {
@@ -286,6 +347,8 @@ def adopt(
             "configuration_sha256": config.source_digest,
             "audit": audit,
         }
+        if history["commits"]:
+            candidate.update(previous_head=parent, inherited_history=history)
         policy = project.verification_policy.evidence()
         if not existing:
             record = {
