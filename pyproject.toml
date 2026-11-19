@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Local, review-first development orchestration with Codex CLI"
 readme = "README.md"
 requires-python = ">=3.14"
-dependencies = []
+dependencies = ["PyYAML>=6.0.3,<7"]
 
 [project.scripts]
 dev-agent = "dev_agent.cli:main"
