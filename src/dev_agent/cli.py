@@ -13,7 +13,14 @@ from pathlib import Path
 from dev_agent.config import default_config_path, load_config
 from dev_agent.delivery.implementation import implement
 from dev_agent.errors import DevAgentError
-from dev_agent.records import Store
+from dev_agent.records import RunRecord, Store
+from dev_agent.reporting.terminal import (
+    print_evidence,
+    render_list,
+    render_run,
+    retained,
+    terminal_text,
+)
 from dev_agent.run_admin import cleanup, inspect_run
 from dev_agent.verification.runs import verify
 
@@ -39,10 +46,20 @@ def parser() -> argparse.ArgumentParser:
     root.add_argument(
         "--config", type=Path, default=default_config_path(), help="External TOML config"
     )
+    root.add_argument("--json", action="store_true", help="Write structured output to stdout")
+    output_options = argparse.ArgumentParser(add_help=False)
+    output_options.add_argument(
+        "--json",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Write structured output to stdout",
+    )
     commands = root.add_subparsers(dest="command", required=True)
-    projects = commands.add_parser("projects").add_subparsers(dest="action", required=True)
-    projects.add_parser("list")
-    task = commands.add_parser("implement")
+    projects = commands.add_parser("projects", parents=[output_options]).add_subparsers(
+        dest="action", required=True
+    )
+    projects.add_parser("list", parents=[output_options])
+    task = commands.add_parser("implement", parents=[output_options])
     task.add_argument("task")
     task.add_argument("--project", required=True)
     task.add_argument("--prompt-file", type=Path, required=True)
@@ -55,6 +72,7 @@ def parser() -> argparse.ArgumentParser:
     )
     adoption = commands.add_parser(
         "adopt",
+        parents=[output_options],
         help="Qualify a retained legacy implementation without running Codex implementation",
     )
     adoption.add_argument("run_id", metavar="ORIGINAL-RUN-ID")
@@ -67,20 +85,26 @@ def parser() -> argparse.ArgumentParser:
     adoption.add_argument("--prepare", action="store_true")
     adoption.add_argument("--accept-legacy", metavar="APPROVAL-SHA256")
     investigation = commands.add_parser(
-        "investigate", help="Read-only Jira/baseline investigation; never start implementation"
+        "investigate",
+        parents=[output_options],
+        help="Read-only Jira/baseline investigation; never start implementation",
     )
     investigation.add_argument("task")
     investigation.add_argument("--project", required=True)
     investigation.add_argument("--dry-run", action="store_true")
-    runs = commands.add_parser("runs").add_subparsers(dest="action", required=True)
-    runs.add_parser("list")
-    runs.add_parser("show").add_argument("run_id")
-    commands.add_parser("inspect").add_argument("run_id")
-    commands.add_parser("results", help="Print a run's exported results directory").add_argument(
-        "run_id"
+    runs = commands.add_parser("runs", parents=[output_options]).add_subparsers(
+        dest="action", required=True
     )
+    runs.add_parser("list", parents=[output_options])
+    runs.add_parser("show", parents=[output_options]).add_argument("run_id")
+    commands.add_parser("inspect", parents=[output_options]).add_argument("run_id")
+    commands.add_parser(
+        "results", parents=[output_options], help="Print a run's exported results directory"
+    ).add_argument("run_id")
     verification = commands.add_parser(
-        "verify", help="Append verification against a retained worktree; never run Codex"
+        "verify",
+        parents=[output_options],
+        help="Append verification against a retained worktree; never run Codex",
     )
     verification.add_argument("run_id")
     verification.add_argument("--profile", choices=("targeted", "full", "legacy"))
@@ -89,7 +113,9 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Explicitly run configured preparation before verification",
     )
-    publication = commands.add_parser("publish", help="Preview or confirm GitHub PR publication")
+    publication = commands.add_parser(
+        "publish", parents=[output_options], help="Preview or confirm GitHub PR publication"
+    )
     publication.add_argument("run_id")
     pr_mode_argument(publication)
     approval = publication.add_mutually_exclusive_group()
@@ -105,7 +131,9 @@ def parser() -> argparse.ArgumentParser:
     publication.add_argument("--full-verification-reason")
     publication.add_argument("--acknowledge-stale-base", action="store_true")
     branch = commands.add_parser(
-        "push", help="Preview or confirm a managed branch push without creating a PR"
+        "push",
+        parents=[output_options],
+        help="Preview or confirm a managed branch push without creating a PR",
     )
     branch.add_argument("run_id")
     approval = branch.add_mutually_exclusive_group()
@@ -123,11 +151,15 @@ def parser() -> argparse.ArgumentParser:
     branch.add_argument(
         "--plan-sha256", help="Reviewed push preview digest; required with --confirm"
     )
-    ci = commands.add_parser("ci", help="Observe checks for the recorded published commit")
+    ci = commands.add_parser(
+        "ci", parents=[output_options], help="Observe checks for the recorded published commit"
+    )
     ci.add_argument("run_id")
     ci.add_argument("--watch", action="store_true")
     delivery = commands.add_parser(
-        "deliver", help="MCP-only ticket delivery; fail closed if intake is unavailable"
+        "deliver",
+        parents=[output_options],
+        help="MCP-only ticket delivery; fail closed if intake is unavailable",
     )
     delivery.add_argument("task")
     delivery.add_argument("--project", required=True)
@@ -139,7 +171,9 @@ def parser() -> argparse.ArgumentParser:
     delivery.add_argument("--dry-run", action="store_true")
     delivery.add_argument("--resume", metavar="EXECUTION-ID")
     clean = commands.add_parser(
-        "cleanup", description="Remove a worktree or investigation snapshot; retain run records"
+        "cleanup",
+        parents=[output_options],
+        description="Remove a worktree or investigation snapshot; retain run records",
     )
     clean.add_argument("run_id")
     clean.add_argument("--yes", action="store_true", help="Explicitly confirm removal")
@@ -203,22 +237,60 @@ def main(argv: list[str] | None = None) -> int:
         # A terminal suspension must not freeze adoption while it owns a worktree lock.
         signals += (signal.SIGTSTP,)
     previous = {sig: signal.signal(sig, interrupted) for sig in signals}
+    store = None
+
+    def show(
+        record: RunRecord,
+        *,
+        data: object | None = None,
+        preview: RunRecord | None = None,
+        inspection: RunRecord | None = None,
+        observation: RunRecord | None = None,
+        code: int = 0,
+    ) -> int:
+        """Write the existing structured payload or its terminal view."""
+        if args.json:
+            dump(record if data is None else data)
+            if code and record:
+                print_evidence(store, record, sys.stderr)
+        else:
+            render_run(
+                store,
+                record,
+                args.command,
+                preview=preview,
+                inspection=inspection,
+                observation=observation,
+            )
+        return code
+
+    def progress(stage: str) -> None:
+        """Stream phase notices on stderr, separate from the final stdout value."""
+        detail = json.dumps(stage) if args.json else terminal_text(stage.replace("_", " "))
+        operation = "delivery" if args.command == "deliver" else args.command
+        try:
+            print(f"dev-agent {operation}: {detail}", file=sys.stderr, flush=True)
+        except OSError:
+            pass  # A closed diagnostic stream must not interrupt a running workflow.
+
     try:
         config = load_config(args.config)
         store = Store(config.runs_root)
         if args.command == "projects":
-            dump(
-                [
-                    {
-                        "name": p.name,
-                        "repository": str(p.repository),
-                        "base_branch": p.base_branch,
-                        "verification": [c.name for c in p.verification],
-                        "verification_policy": p.verification_policy.evidence(),
-                    }
-                    for p in config.projects.values()
-                ]
-            )
+            rows = [
+                {
+                    "name": p.name,
+                    "repository": str(p.repository),
+                    "base_branch": p.base_branch,
+                    "verification": [c.name for c in p.verification],
+                    "verification_policy": p.verification_policy.evidence(),
+                }
+                for p in config.projects.values()
+            ]
+            if args.json:
+                dump(rows)
+            else:
+                render_list(rows, ("name", "base_branch", "repository"))
         elif args.command == "implement":
             record = implement(
                 config,
@@ -228,15 +300,12 @@ def main(argv: list[str] | None = None) -> int:
                 dry_run=args.dry_run,
                 verification=args.verification,
                 scope=tuple(args.scope) if args.scope else None,
+                progress=None if args.json else progress,
             )
             if args.dry_run:
-                dump({"dry_run": True, "plan": record})
+                show({}, data={"dry_run": True, "plan": record}, preview=record)
                 return 0
-            dump(record)
-            print(f"Worktree retained: {record['worktree']}")
-            print(f"Run report/logs: {store.directory(record['run_id'])}")
-            print(f"Results: {record.get('results_directory', 'not exported')}")
-            return exit_code(record["outcome"])
+            return show(record, code=exit_code(record["outcome"]))
         elif args.command == "adopt":
             from dev_agent.delivery.adoption import adopt, summary
 
@@ -248,32 +317,22 @@ def main(argv: list[str] | None = None) -> int:
                 accept_legacy=args.accept_legacy,
                 approve_head=args.approve_head,
             )
-            dump(summary(record))
-            if record["adoption"]["status"] == "interrupted":
-                return 130
-            return (
-                0
-                if record["adoption"]["status"] in ("awaiting_legacy_approval", "approved")
-                else 13
-            )
+            status = record["adoption"]["status"]
+            if status == "interrupted":
+                code = 130
+            else:
+                code = 0 if status in ("awaiting_legacy_approval", "approved") else 13
+            return show(record, data=summary(record) if args.json else None, code=code)
         elif args.command == "investigate":
             from dev_agent.investigation.workflow import investigate
 
             record = investigate(config, args.project, args.task, dry_run=args.dry_run)
-            dump({"dry_run": True, "plan": record} if args.dry_run else record)
-            if not args.dry_run:
-                destination = record.get("results_directory") or (
-                    "export unavailable; inspect canonical record"
-                )
-                print(f"Investigation results: {destination}")
-            return 0 if args.dry_run else exit_code(record["outcome"])
+            if args.dry_run:
+                return show({}, data={"dry_run": True, "plan": record}, preview=record)
+            return show(record, code=exit_code(record["outcome"]))
         elif args.command == "deliver":
             from dev_agent.delivery.workflow import deliver
             from dev_agent.reporting.delivery import summary
-
-            def progress(stage: str) -> None:
-                """Stream a delivery phase notice to stderr without mixing it into JSON output."""
-                print("dev-agent delivery: " + json.dumps(stage), file=sys.stderr, flush=True)
 
             record = deliver(
                 config,
@@ -286,37 +345,42 @@ def main(argv: list[str] | None = None) -> int:
                 pr_mode=args.pr_mode,
                 progress=progress,
             )
-            dump(record if args.dry_run else summary(config, record))
-            return 0 if record.get("outcome") == "delivered" else 13
+            code = 0 if record.get("outcome") == "delivered" else 13
+            if args.dry_run:
+                return show({}, data=record, preview=record, code=code)
+            return show(record, data=summary(config, record) if args.json else None, code=code)
         elif args.command == "runs":
             if args.action == "show":
-                dump(store.load(args.run_id))
+                show(store.load(args.run_id))
             else:
-                dump(
-                    [
-                        {
-                            k: r[k]
-                            for k in (
-                                "run_id",
-                                "project",
-                                "task",
-                                "outcome",
-                                "created_at",
-                                "cleanup",
-                            )
-                        }
-                        | {
-                            "kind": r.get("kind", "implementation"),
-                            "results_directory": r.get("results_directory"),
-                            "latest_verification_outcome": (r.get("verification_attempts") or [{}])[
-                                -1
-                            ].get("outcome"),
-                        }
-                        for r in store.list()
-                    ]
-                )
+                rows = [
+                    {
+                        k: r.get(k)
+                        for k in (
+                            "run_id",
+                            "project",
+                            "task",
+                            "outcome",
+                            "created_at",
+                            "cleanup",
+                        )
+                    }
+                    | {
+                        "kind": r.get("kind", "implementation"),
+                        "results_directory": r.get("results_directory"),
+                        "latest_verification_outcome": (r.get("verification_attempts") or [{}])[
+                            -1
+                        ].get("outcome"),
+                    }
+                    for r in store.list()
+                ]
+                if args.json:
+                    dump(rows)
+                else:
+                    render_list(rows, ("run_id", "project", "task", "kind", "outcome"))
         elif args.command == "inspect":
-            dump(inspect_run(config, args.run_id))
+            info = inspect_run(config, args.run_id)
+            show({} if args.json else store.load(args.run_id), data=info, inspection=info)
         elif args.command == "results":
             record = store.load(args.run_id)
             directory = record.get("results_directory")
@@ -324,25 +388,27 @@ def main(argv: list[str] | None = None) -> int:
                 raise DevAgentError(
                     "No exported results for this run; historical evidence remains in runs_root"
                 )
-            print(directory)
+            if args.json:
+                dump({"results_directory": directory})
+            else:
+                print(terminal_text(directory))
         elif args.command == "verify":
             record = verify(config, args.run_id, args.profile, prepare_environment=args.prepare)
-            dump(record["verification_attempts"][-1])
-            print(f"Original outcome: {record['outcome']}; original agent evidence retained")
-            print(f"Results: {record.get('results_directory', 'not exported')}")
-            return (
-                5
-                if record.get("results_error")
-                else exit_code(record["verification_attempts"][-1]["outcome"])
-            )
+            attempt = record["verification_attempts"][-1]
+            code = 5 if record.get("results_error") else exit_code(attempt["outcome"])
+            return show(record, data=attempt, code=code)
         elif args.command == "cleanup":
             # Inspect before prompting so confirmation refers to a concrete, validated path.
             info = inspect_run(config, args.run_id)
-            dump(info)
+            messages = sys.stderr if args.json else sys.stdout
+            path = info.get("worktree") or info.get("snapshot_directory")
+            if path:
+                print(f"Cleanup target: {terminal_text(path)}", file=messages)
             print(
                 "Cleanup removes the investigation snapshot; evidence is retained."
                 if info.get("kind") == "investigation"
-                else "Cleanup removes the worktree. Its branch and run records are retained."
+                else "Cleanup removes the worktree. Its branch and run records are retained.",
+                file=messages,
             )
             if args.force:
                 print(
@@ -350,13 +416,20 @@ def main(argv: list[str] | None = None) -> int:
                     "other investigation evidence is retained."
                     if info.get("kind") == "investigation"
                     else "FORCE: ALL uncommitted, untracked and ignored worktree files "
-                    "will be permanently lost."
+                    "will be permanently lost.",
+                    file=messages,
                 )
             confirmed = args.yes
             if not confirmed and sys.stdin.isatty():
-                confirmed = input(f"Type {args.run_id} to confirm removal: ") == args.run_id
+                print(
+                    f"Type {terminal_text(args.run_id)} to confirm removal: ",
+                    end="",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                confirmed = input() == args.run_id
             record = cleanup(config, args.run_id, confirmed=confirmed, force=args.force)
-            dump({"run_id": args.run_id, "cleanup": record["cleanup"]})
+            show(record, data={"run_id": args.run_id, "cleanup": record["cleanup"]})
         elif args.command in ("push", "publish"):
             from dev_agent.delivery.publication import publish_run
 
@@ -381,27 +454,46 @@ def main(argv: list[str] | None = None) -> int:
                 plan_sha256=args.plan_sha256,
                 **options,
             )
-            dump(result.get("publication", result))
             if "plan" in result:
-                return 2 if result["plan"]["blockers"] else 0
+                return show(
+                    retained(store, args.run_id),
+                    data=result,
+                    preview=result["plan"],
+                    code=2 if result["plan"]["blockers"] else 0,
+                )
+            publication = result["publication"]
             if args.command == "push":
-                return 0 if result["publication"]["status"] == "pushed" else 11
-            if result["publication"]["status"] != "published":
-                return 11
-            observation = result["publication"]["ci_observations"][-1]
-            return 0 if observation["status"] == "passed" else 12
+                code = 0 if publication["status"] == "pushed" else 11
+            elif publication["status"] != "published":
+                code = 11
+            else:
+                observation = publication["ci_observations"][-1]
+                code = 0 if observation["status"] == "passed" else 12
+            return show(result, data=publication, code=code)
         elif args.command == "ci":
             from dev_agent.delivery.publication import ci_run
 
             observation = ci_run(config, args.run_id, watch=args.watch)
-            dump(observation)
-            return 0 if observation["status"] == "passed" else 12
+            return show(
+                retained(store, args.run_id),
+                data=observation,
+                observation=observation,
+                code=0 if observation["status"] == "passed" else 12,
+            )
         return 0
     except (DevAgentError, OSError, ValueError, KeyError) as exc:
-        print(f"dev-agent: {str(exc)!r}", file=sys.stderr)
+        print(f"dev-agent: {terminal_text(exc)}", file=sys.stderr)
+        if record := retained(
+            store, getattr(args, "run_id", None) or getattr(args, "resume", None)
+        ):
+            print_evidence(store, record, sys.stderr)
         return 2
     except KeyboardInterrupt:
         print("dev-agent: interrupted", file=sys.stderr)
+        if record := retained(
+            store, getattr(args, "run_id", None) or getattr(args, "resume", None)
+        ):
+            print_evidence(store, record, sys.stderr)
         return 130
     finally:
         for sig, handler in previous.items():
