@@ -67,6 +67,12 @@ allowed_paths = ["src", "tests", "docs", "pyproject.toml", "uv.lock"]
 ci_timeout_seconds = 600
 poll_interval_seconds = 10
 
+# Optional; the default requires local targeted and full verification.
+# To use remote-ci, replace the mode below and supply literal GitHub Actions job names:
+# required_checks = { ".github/workflows/ci.yml" = ["Backend tests", "Frontend tests"] }
+[projects.example.verification_policy]
+mode = "local-full"
+
 # Implemented investigation route: REST. Native Codex MCP replacement is not yet qualified.
 # There is no project mcp table; unknown settings are rejected. See docs/mcp-qualification.md.
 # Optional investigation-only settings. No credentials are stored here.
