@@ -79,9 +79,13 @@ class GitHub:
             )
         except OSError, subprocess.TimeoutExpired:
             raise GitHubError(f"GitHub {args[0]} could not complete; no automatic retry") from None
-        if missing and result.returncode and b"HTTP 404" in result.stderr:
-            return None
         if result.returncode:
+            if missing:
+                statuses = re.findall(
+                    rb"^gh: [^\r\n]* \(HTTP ([0-9]{3})\)\r?$", result.stderr, flags=re.MULTILINE
+                )
+                if statuses == [b"404"]:
+                    return None
             # External diagnostics may contain headers/tokens. Never export them verbatim.
             raise GitHubError(
                 f"GitHub {args[0]} failed (exit {result.returncode}); inspect gh locally"
@@ -92,13 +96,17 @@ class GitHub:
 
     def api(self, suffix: str, *, missing: bool = False) -> object:
         """Decode a repository-relative GitHub GET response, preserving an allowed 404."""
+        endpoint = f"repos/{self.repository}"
+        # GitHub returns 404 for the repository metadata endpoint with a trailing slash.
+        if suffix:
+            endpoint = f"{endpoint}/{suffix}"
         result = self.call(
             "api",
             "--hostname",
             "github.com",
             "--method",
             "GET",
-            f"repos/{self.repository}/{suffix}",
+            endpoint,
             missing=missing,
         )
         try:
@@ -111,16 +119,22 @@ class GitHub:
         self.call("auth", "status", "--hostname", "github.com")
         try:
             account = json.loads(self.call("api", "--hostname", "github.com", "user"))["login"]
-            repo = self.api("")
-            if repo["full_name"].lower() != self.repository.lower():
-                raise GitHubError("GitHub repository does not match the configured destination")
-            if not repo.get("permissions", {}).get("push"):
-                raise GitHubError("Authenticated GitHub account lacks push permission")
-            if repo.get("archived") or repo.get("disabled"):
-                raise GitHubError("GitHub repository is archived or disabled")
-            return account
-        except KeyError, TypeError, ValueError:
+        except (KeyError, TypeError, ValueError):
             raise GitHubError("Cannot establish GitHub account/repository permissions") from None
+        repo = self.api("")
+        if not isinstance(account, str) or not account.strip() or not isinstance(repo, dict):
+            raise GitHubError("Cannot establish GitHub account/repository permissions")
+        name = repo.get("full_name")
+        if not isinstance(name, str):
+            raise GitHubError("Cannot establish GitHub account/repository permissions")
+        if name.lower() != self.repository.lower():
+            raise GitHubError("GitHub repository does not match the configured destination")
+        permissions = repo.get("permissions")
+        if not isinstance(permissions, dict) or permissions.get("push") is not True:
+            raise GitHubError("Authenticated GitHub account lacks push permission")
+        if repo.get("archived") or repo.get("disabled"):
+            raise GitHubError("GitHub repository is archived or disabled")
+        return account
 
     def branch(self, name: str, *, missing: bool = False) -> str | None:
         """Read a branch's remote commit SHA and optionally allow a missing branch."""
@@ -184,7 +198,7 @@ class GitHub:
                 raise ValueError
             raw.decode("utf-8")
             return raw
-        except KeyError, TypeError, ValueError:
+        except (KeyError, TypeError, ValueError):
             raise GitHubError("Cannot inspect workflow content safely") from None
 
 
@@ -320,7 +334,7 @@ def ci_observation(client: GitHub, commit: str, pr: int, workflows: list[RunReco
         if not checks:
             status = "no_checks_configured" if not workflows else "no_checks"
         observation.update(checks=checks, status=status)
-    except DevAgentError, KeyError, TypeError, ValueError:
+    except (DevAgentError, KeyError, TypeError, ValueError):
         observation.update(
             status="unable_to_retrieve", error="Cannot establish complete commit-specific CI status"
         )
