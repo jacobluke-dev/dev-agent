@@ -105,20 +105,20 @@ if a[:2]==['pr','create']:
 if a[0]!='api':finish(code=1)
 e=a[-1]
 if e=='user':finish({{'login':'example-user'}})
-if e=='repos/example/project/':
+if e=='repos/example/project':
  finish({{'full_name':'example/project',
          'permissions':{{'push':not s.get('no_permission')}}}})
 if '/git/ref/heads/main' in e:finish({{'object':{{'sha':s['base']}}}})
 if '/git/ref/heads/' in e:
  if s['head']:finish({{'object':{{'sha':s['head']}}}})
- print('HTTP 404',file=sys.stderr);finish(code=1)
+ print('gh: Not Found (HTTP 404)',file=sys.stderr);finish(code=1)
 if '/pulls?' in e:finish([s['pull']] if s['pull'] else [])
 if '/pulls/7' in e:
  s['pull']['base']['sha']=s['base']
  finish(s['pull'])
 if '/contents/.github/workflows?' in e:
  if not s.get('workflows'):
-  print('HTTP 404',file=sys.stderr);finish(code=1)
+  print('gh: Not Found (HTTP 404)',file=sys.stderr);finish(code=1)
  finish([{{'path':'.github/workflows/ci.yml'}}])
 if '/contents/.github/workflows/ci.yml?' in e:
  raw=b'on: [pull_request, push, workflow_dispatch]\\njobs:\\n  test:\\n'

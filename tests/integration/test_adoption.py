@@ -552,3 +552,33 @@ def test_adoption_reconciles_interrupted_installer_after_empty_refusals(
     assert retry["status"] == "passed"
     assert reviewer.calls == 1
     assert (store.directory(run_id) / "record.json").read_bytes() == history
+
+
+def test_advanced_adoption_push_requires_fresh_legacy_acceptance(legacy: LegacyFixture) -> None:
+    """Qualify an already-published CI parent without rewriting the original legacy run."""
+    (local, original, root, state), reviewer, original_bytes = legacy
+    config = enable_remote_ci(local, state)
+    path = root / ".github/workflows/ci.yml"
+    path.write_text(path.read_text() + "# separate history\n")
+    git(root, "add", ".github/workflows/ci.yml")
+    git(root, "commit", "-m", "Previously published CI change")
+    head = source_state(root)["head_commit"]
+    with pytest.raises(DevAgentError, match="already be published"):
+        adopt(config, original["run_id"], approve_head=head)
+    state_change(state, head=head, checks="absent", workflows=False)
+    candidate = adopt(config, original["run_id"], approve_head=head)
+    assert candidate["adoption"]["candidate"]["previous_head"] == head
+    assert reviewer.calls == 1
+    args = (config, candidate["run_id"])
+    with pytest.raises(DevAgentError, match="legacy approval"):
+        publish_run(*args, branch_only=True)
+    adopt(config, original["run_id"], accept_legacy=candidate["adoption"]["approval_sha256"])
+    plan = publish_run(*args, branch_only=True)["plan"]
+    assert not plan["blockers"]
+    pub = publish_run(*args, branch_only=True, confirmed=True, plan_sha256=plan["plan_sha256"])
+    assert pub["publication"]["status"] == "pushed"
+    assert pub["adoption"]["historical_instruction_enforcement"] == "not_recorded"
+    assert pub["publication"]["ci_observations"] == []
+    assert (
+        Store(config.runs_root).directory(original["run_id"]) / "record.json"
+    ).read_bytes() == original_bytes

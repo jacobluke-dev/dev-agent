@@ -465,3 +465,158 @@ def test_github_configuration_rejects_unsafe_settings(config_file: Path, fragmen
     config_file.write_text(config_file.read_text() + "\n[projects.example.github]\n" + fragment)
     with pytest.raises(DevAgentError):
         load_config(config_file)
+
+
+@pytest.mark.parametrize("mode", ["draft", "ready"])
+def test_push_then_separate_pr(publishing: Publishing, mode: str) -> None:
+    """Push an approved manifest once, then publish either PR mode at that exact commit."""
+    config, record, root, state = publishing
+    run_id = record["run_id"]
+    state_change(state, head=record["baseline_commit"], checks="failed")
+    argv = ["--config", str(config.path), "push", run_id]
+    assert main([*argv, "--dry-run"]) == 0
+    assert main([*argv, "--confirm"]) == 2
+    assert main([*argv, "--file", "hello.py"]) == 2
+    plan = publish_run(config, run_id, branch_only=True)["plan"]
+    assert "draft" not in plan
+    assert plan["previous_head"] == plan["previous_remote_head"] == record["baseline_commit"]
+    assert plan["verification"]["profiles"]["targeted"]["status"] == "passed"
+    assert not plan["blockers"]
+    before = source_state(root)
+    assert main([*argv, "--confirm", "--plan-sha256", "wrong"]) == 2
+    assert before["fingerprint"] == source_state(root)["fingerprint"]
+    confirm = [*argv, "--confirm", "--plan-sha256", plan["plan_sha256"]]
+    assert main(confirm) == 0
+    assert main(confirm) == 0
+    pub = Store(config.runs_root).load(run_id)["publication"]
+    assert pub["status"] == "pushed"
+    assert pub["ci_observations"] == []
+    assert output(root, "rev-parse", "HEAD^") == plan["previous_head"]
+    assert not pub.get("pr_url")
+    remote = json.loads(state.read_text())
+    assert remote["pushes"] == 1 and remote["head"] == pub["commit_sha"]
+    assert remote["pull"] is None
+    assert all(
+        not any(word in arg for word in ("pulls", "workflows", "check-runs"))
+        for call in remote["calls"]
+        for arg in call
+    )
+    result = publish_run(config, run_id, pr_mode=mode, confirmed=True, watch=False)["publication"]
+    assert result["draft"] == (mode == "draft")
+    assert result["ci_observations"][-1]["status"] == "failed"
+    assert result["commit_sha"] == pub["commit_sha"]
+    assert json.loads(state.read_text())["pushes"] == 1
+
+
+def test_push_retry_and_remote_drift(publishing: Publishing) -> None:
+    """Recover a failed push and refuse to recreate a subsequently removed remote branch."""
+    config, record, root, state = publishing
+    args = (config, record["run_id"])
+    plan = publish_run(*args, branch_only=True)["plan"]
+    confirm = dict(branch_only=True, confirmed=True, plan_sha256=plan["plan_sha256"])
+    state_change(state, push_failure=True)
+    failure = publish_run(*args, **confirm)["publication"]
+    assert failure["failure_phase"] == "push"
+    commit = failure["commit_sha"]
+    state_change(state, push_failure=False, head=commit)
+    success = publish_run(*args, **confirm)["publication"]
+    assert success["status"] == "pushed"
+    assert output(root, "rev-parse", "HEAD") == commit
+    assert json.loads(state.read_text())["pushes"] == 1
+    state_change(state, head=None)
+    assert publish_run(*args, branch_only=True)["plan"]["blockers"]
+
+
+def test_push_advanced_feature_branch(publishing: Publishing) -> None:
+    """Allow only a reviewed, already-published ancestor with fresh verification."""
+    config, record, root, state = publishing
+    args = (config, record["run_id"])
+    workflow = root / ".github/workflows/ci.yml"
+    workflow.write_text(workflow.read_text() + "# branch-specific change\n")
+    git(root, "add", ".github/workflows/ci.yml")
+    git(root, "commit", "-m", "Branch CI")
+    parent = output(root, "rev-parse", "HEAD")
+    with pytest.raises(DevAgentError, match="Unexpected worktree HEAD"):
+        publish_run(*args, branch_only=True)
+    opts = dict(branch_only=True, approve_head=parent)
+    with pytest.raises(DevAgentError, match="Approved branch HEAD differs"):
+        publish_run(*args, branch_only=True, approve_head=parent[:8])
+    plan = publish_run(*args, **opts)["plan"]
+    assert any("unexpected commit" in b for b in plan["blockers"])
+    state_change(state, head=parent)
+    plan = publish_run(*args, **opts)["plan"]
+    assert any("targeted" in b for b in plan["blockers"])
+    verify(*args, "targeted")
+    verify(*args, "full")
+    plan = publish_run(*args, **opts)["plan"]
+    assert plan["blockers"] == []
+    assert plan["inherited_history"] == {"paths": [".github/workflows/ci.yml"], "commits": [parent]}
+    assert {f["path"] for f in plan["approved_files"]} == {"hello.py", "new file.txt"}
+    workflow.write_text(workflow.read_text() + "# unapproved pending change\n")
+    with pytest.raises(DevAgentError, match="overlaps inherited"):
+        publish_run(*args, confirmed=True, plan_sha256=plan["plan_sha256"], **opts)
+    git(root, "restore", "--", ".github/workflows/ci.yml")
+    pub = publish_run(*args, confirmed=True, plan_sha256=plan["plan_sha256"], **opts)["publication"]
+    assert pub["status"] == "pushed"
+    assert output(root, "rev-parse", "HEAD^") == parent
+    assert (
+        Store(config.runs_root).load(record["run_id"])["baseline_commit"]
+        == record["baseline_commit"]
+    )
+    assert any("Inherited branch" in b for b in publish_run(*args)["plan"]["blockers"])
+
+    state_change(state, base=parent)
+    pr = publish_run(*args, pr_mode="ready", acknowledge_stale_base=True, confirmed=True)[
+        "publication"
+    ]
+    assert pr["commit_sha"] == pub["commit_sha"] and pr["draft"] is False
+    assert json.loads(state.read_text())["pushes"] == 1
+
+
+def test_push_reconciles_commit_after_controller_interruption(publishing: Publishing) -> None:
+    """A clean exact commit matching the staged journal can be resumed without recommitting."""
+    config, record, root, state = publishing
+    run_id = record["run_id"]
+    plan = publish_run(config, run_id, branch_only=True)["plan"]
+    confirm = dict(branch_only=True, confirmed=True, plan_sha256=plan["plan_sha256"])
+    state_change(state, push_failure=True)
+    interrupted = publish_run(config, run_id, **confirm)
+    pub = interrupted["publication"]
+    commit = pub.pop("commit_sha")
+    staged_at = next(i for i, e in enumerate(pub["events"]) if e["status"] == "staged")
+    pub.update(status="staged", events=pub["events"][: staged_at + 1])
+    Store(config.runs_root).save(interrupted)
+    state_change(state, push_failure=False)
+    result = publish_run(config, run_id, **confirm)["publication"]
+    assert result["status"] == "pushed" and result["commit_sha"] == commit
+    assert output(root, "rev-parse", "HEAD^") == record["baseline_commit"]
+
+
+def test_advanced_parent_cannot_change_instructions(publishing: Publishing) -> None:
+    """Explicit parent approval cannot substitute a different repository instruction set."""
+    config, record, root, state = publishing
+    (root / "AGENTS.md").write_text("Different baseline instructions.")
+    git(root, "add", "AGENTS.md")
+    git(root, "commit", "-m", "Change root instructions")
+    parent = output(root, "rev-parse", "HEAD")
+    state_change(state, head=parent)
+    with pytest.raises(DevAgentError, match="changes baseline instruction"):
+        publish_run(config, record["run_id"], branch_only=True, approve_head=parent)
+
+
+def test_push_refuses_failed_checks_and_unapproved_scope(publishing: Publishing) -> None:
+    """Keep local evidence and scope gates active for branch-only publication."""
+    config, record, root, state = publishing
+    record["verification_attempts"][-1]["status"] = "failed"
+    Store(config.runs_root).save(record)
+    args = (config, record["run_id"])
+    plan = publish_run(*args, branch_only=True)["plan"]
+    assert any("full verification" in b.lower() for b in plan["blockers"])
+    with pytest.raises(DevAgentError, match="blocked"):
+        publish_run(*args, branch_only=True, confirmed=True, plan_sha256=plan["plan_sha256"])
+    (root / "other.py").write_text("# unrelated\n")
+    plan = publish_run(*args, branch_only=True)["plan"]
+    assert plan["excluded_files"] == [
+        {"path": "other.py", "reason": "outside github.allowed_paths"}
+    ]
+    assert not json.loads(state.read_text()).get("pushes")

@@ -189,7 +189,10 @@ def summary(record: RunRecord, directory: Path) -> str:
             ("Status", publication.get("status")),
             ("Repository", publication.get("repository")),
             ("Published commit", publication.get("commit_sha")),
-            ("PR mode", publication.get("pr_mode", "draft")),
+            (
+                "PR mode",
+                publication.get("pr_mode") or ("draft" if publication.get("pr_url") else None),
+            ),
             ("Pull request", publication.get("pr_url")),
             (
                 "Verification policy",
