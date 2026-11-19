@@ -342,13 +342,14 @@ def test_cli_progress_and_non_success_on_unavailable_mcp(
                 "--draft",
                 "--confirm",
                 "--watch",
+                "--json",
             ]
         )
         == 13
     )
     captured = capsys.readouterr()
     assert "retrieving_mcp_requirements" in captured.err
-    assert "execution_id" in captured.out and "mcp_unavailable" in captured.out
+    assert json.loads(captured.out)["status"] == "mcp_unavailable"
 
 
 @pytest.mark.parametrize("ci", ["pending", "failed", "skipped", "absent"])

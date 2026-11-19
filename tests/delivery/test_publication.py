@@ -333,10 +333,15 @@ def test_cli_draft_confirmation_and_preview(
 ) -> None:
     """Enforce the preview and confirmation boundary through the CLI."""
     config, record, root, state = publishing
-    assert (
-        main(["--config", str(config.path), "publish", record["run_id"], "--draft", "--dry-run"])
-        == 0
-    )
+    args = ["--config", str(config.path), "publish", record["run_id"], "--draft", "--dry-run"]
+    assert main(args) == 0
+    human = capsys.readouterr().out
+    assert "Plan digest" in human and "2 in proposed manifest" in human and "PR mode" in human
+    assert "approved_files" not in human and "new file.txt" not in human
+    assert main([*args, "--json"]) == 0
+    plan = json.loads(capsys.readouterr().out)["plan"]
+    assert {entry["path"] for entry in plan["approved_files"]} == {"hello.py", "new file.txt"}
+    assert plan["plan_sha256"] in human
     assert not json.loads(state.read_text()).get("pushes")
     assert (
         main(["--config", str(config.path), "publish", record["run_id"], "--draft", "--confirm"])

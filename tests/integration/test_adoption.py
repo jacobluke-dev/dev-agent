@@ -422,7 +422,16 @@ def test_adoption_cli_cancels_preparation_without_leaving_lock(
         + f"argv = {json.dumps([sys.executable, '-c', script])}\n"
     )
     proc = subprocess.Popen(
-        [sys.executable, "-m", "dev_agent", "--config", str(config.path), "adopt", run_id],
+        [
+            sys.executable,
+            "-m",
+            "dev_agent",
+            "--config",
+            str(config.path),
+            "adopt",
+            run_id,
+            "--json",
+        ],
         cwd=tmp_path,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

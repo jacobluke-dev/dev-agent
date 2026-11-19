@@ -151,7 +151,7 @@ def test_cli_workflow(
     config_file: Path, prompt: Path, fake_codex: Path, capsys: pytest.CaptureFixture
 ) -> None:
     """Exercise the implementation, listing, inspection and cleanup command sequence."""
-    prefix = ["--config", str(config_file)]
+    prefix = ["--config", str(config_file), "--json"]
     assert main(prefix + ["projects", "list"]) == 0
     assert json.loads(capsys.readouterr().out)[0]["name"] == "example"
     assert (
@@ -184,9 +184,13 @@ def test_cli_workflow(
     assert main(prefix + ["inspect", run_id]) == 0
     assert json.loads(capsys.readouterr().out)["dirty_including_ignored"]
     assert main(prefix + ["cleanup", run_id, "--yes"]) == 2
-    assert "uncommitted" in capsys.readouterr().err
+    refusal = capsys.readouterr()
+    assert "uncommitted" in refusal.err and "record.json" in refusal.err
+    assert refusal.out == ""
     assert main(prefix + ["cleanup", run_id, "--force", "--yes"]) == 0
-    assert "permanently lost" in capsys.readouterr().out
+    completed = capsys.readouterr()
+    assert json.loads(completed.out)["cleanup"]["forced"]
+    assert "permanently lost" in completed.err
 
 
 @pytest.mark.parametrize(

@@ -360,13 +360,13 @@ argv=["false"]
         == 0
     )
     capsys.readouterr()
-    assert main(prefix + ["runs", "list"]) == 0
+    assert main(prefix + ["runs", "list", "--json"]) == 0
     run_id = json.loads(capsys.readouterr().out)[0]["run_id"]
     assert main(prefix + ["results", run_id]) == 0
     assert Path(capsys.readouterr().out.strip()).is_dir()
-    assert main(prefix + ["verify", run_id, "--profile", "full"]) == 4
-    capsys.readouterr()
-    assert main(prefix + ["inspect", run_id]) == 0
+    assert main(prefix + ["verify", run_id, "--profile", "full", "--json"]) == 4
+    assert json.loads(capsys.readouterr().out)["outcome"] == "verification_failed"
+    assert main(prefix + ["inspect", run_id, "--json"]) == 0
     info = json.loads(capsys.readouterr().out)
     assert info["outcome"] == "passed"
     assert info["latest_verification"]["outcome"] == "verification_failed"
@@ -422,4 +422,6 @@ argv=["false"]
         )
         == 6
     )
-    assert '"outcome": "environment_failed"' in capsys.readouterr().out
+    output = capsys.readouterr()
+    assert "[FAIL] environment failed" in output.out
+    assert "report.json" in output.out and "check-required-setup.stderr.log" in output.out

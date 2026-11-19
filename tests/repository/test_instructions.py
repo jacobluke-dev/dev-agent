@@ -547,6 +547,7 @@ implementation_scope = ["frontend", "tests"]
                 "--scope",
                 "hello.py",
                 "--dry-run",
+                "--json",
             ]
         )
         == 0

@@ -391,6 +391,7 @@ instructions = ["AGENTS.md"]
                 "--project",
                 "example",
                 "--dry-run",
+                "--json",
             ]
         )
         == 0
