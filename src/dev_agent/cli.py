@@ -59,6 +59,11 @@ def parser() -> argparse.ArgumentParser:
     )
     adoption.add_argument("run_id", metavar="ORIGINAL-RUN-ID")
     adoption.add_argument("--requirements-run", metavar="INVESTIGATION-RUN-ID")
+    adoption.add_argument(
+        "--approve-head",
+        metavar="FULL-SHA",
+        help="Reviewed, already-published feature branch parent",
+    )
     adoption.add_argument("--prepare", action="store_true")
     adoption.add_argument("--accept-legacy", metavar="APPROVAL-SHA256")
     investigation = commands.add_parser(
@@ -99,6 +104,25 @@ def parser() -> argparse.ArgumentParser:
     publication.add_argument("--allow-incomplete-full", action="store_true")
     publication.add_argument("--full-verification-reason")
     publication.add_argument("--acknowledge-stale-base", action="store_true")
+    branch = commands.add_parser(
+        "push", help="Preview or confirm a managed branch push without creating a PR"
+    )
+    branch.add_argument("run_id")
+    approval = branch.add_mutually_exclusive_group()
+    approval.add_argument("--dry-run", action="store_true")
+    approval.add_argument("--confirm", action="store_true")
+    branch.add_argument(
+        "--file", action="append", help="Repeat for every approved implementation path"
+    )
+    branch.add_argument("--title", help="Reviewed commit title")
+    branch.add_argument(
+        "--approve-head",
+        metavar="FULL-SHA",
+        help="Approve the exact already-published feature branch parent",
+    )
+    branch.add_argument(
+        "--plan-sha256", help="Reviewed push preview digest; required with --confirm"
+    )
     ci = commands.add_parser("ci", help="Observe checks for the recorded published commit")
     ci.add_argument("run_id")
     ci.add_argument("--watch", action="store_true")
@@ -222,6 +246,7 @@ def main(argv: list[str] | None = None) -> int:
                 requirements_run=args.requirements_run,
                 prepare=args.prepare,
                 accept_legacy=args.accept_legacy,
+                approve_head=args.approve_head,
             )
             dump(summary(record))
             if record["adoption"]["status"] == "interrupted":
@@ -332,26 +357,35 @@ def main(argv: list[str] | None = None) -> int:
                 confirmed = input(f"Type {args.run_id} to confirm removal: ") == args.run_id
             record = cleanup(config, args.run_id, confirmed=confirmed, force=args.force)
             dump({"run_id": args.run_id, "cleanup": record["cleanup"]})
-        elif args.command == "publish":
+        elif args.command in ("push", "publish"):
             from dev_agent.delivery.publication import publish_run
 
+            options = (
+                {"branch_only": True, "approve_head": args.approve_head}
+                if args.command == "push"
+                else {
+                    "pr_mode": args.pr_mode,
+                    "summary": args.summary,
+                    "allow_incomplete_full": args.allow_incomplete_full,
+                    "incomplete_full_reason": args.full_verification_reason,
+                    "acknowledge_stale_base": args.acknowledge_stale_base,
+                }
+            )
             result = publish_run(
                 config,
                 args.run_id,
                 confirmed=args.confirm,
                 dry_run=args.dry_run,
-                pr_mode=args.pr_mode,
                 files=tuple(args.file) if args.file else None,
                 title=args.title,
-                summary=args.summary,
                 plan_sha256=args.plan_sha256,
-                allow_incomplete_full=args.allow_incomplete_full,
-                incomplete_full_reason=args.full_verification_reason,
-                acknowledge_stale_base=args.acknowledge_stale_base,
+                **options,
             )
             dump(result.get("publication", result))
             if "plan" in result:
                 return 2 if result["plan"]["blockers"] else 0
+            if args.command == "push":
+                return 0 if result["publication"]["status"] == "pushed" else 11
             if result["publication"]["status"] != "published":
                 return 11
             observation = result["publication"]["ci_observations"][-1]
